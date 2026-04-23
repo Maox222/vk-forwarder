@@ -19,8 +19,6 @@ namespace vk_forwarder
             
             api.Authorize(new ApiAuthParams
             {
-                Login = Environment.GetEnvironmentVariable("VK_LOGIN"),
-                Password = Environment.GetEnvironmentVariable("VK_PASSWORD"),
                 AccessToken = vkToken
             });
         }
@@ -56,10 +54,28 @@ namespace vk_forwarder
                         }
                     }
                 }
+                catch (VkNet.Exception.LongPollKeyExpiredException)
+                {
+                    // Код 2: ключ истёк — обновляем только key и ts
+                    Console.WriteLine("[VK LongPoll] Ключ истёк, обновляем...");
+                    var fresh = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
+                    longPollServer.Key = fresh.Key;
+                    longPollServer.Ts = fresh.Ts;
+                }
+                catch (VkNet.Exception.LongPollInfoLostException)
+                {
+                    // Код 3: история событий потеряна — обновляем всё целиком
+                    Console.WriteLine("[VK LongPoll] История потеряна, переподключаемся...");
+                    longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"[VK LongPoll Error] {ex.Message}");
-                    await Task.Delay(5000, ct); // пауза перед повтором
+                    await Task.Delay(5000, ct);
                 }
 
                 await Task.Delay(2000, ct);
