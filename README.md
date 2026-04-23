@@ -99,6 +99,8 @@ Environment=TG_BOT_TOKEN=токен_бота               # @BotFather
 Environment=TG_ADMIN_ID=ваш_id                    # @Getmyid_bot
 Environment=VK_GROUP_TOKEN=токен_вк               # Управление → (https://vkhost.github.io/)
 Environment=VK_GROUP_ID=id_группы_вк              # только цифры, без минуса
+Environment=VK_LOGIN=Логин от ВК
+Environment=VK_PASSWORD=Пароль от ВК
 
 [Install]
 WantedBy=multi-user.target
