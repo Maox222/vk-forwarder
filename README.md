@@ -104,6 +104,8 @@ Environment=VK_GROUP_ID=id_группы_вк              # только циф�
 [Install]
 WantedBy=multi-user.target
 ```
+CTRL+O - сохранить, Enter - подтвердить, CTRL+X - выйти
+
 3. Запуск службы
 ```bash
 # Перезагрузить конфигурацию systemd
