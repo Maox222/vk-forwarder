@@ -109,7 +109,7 @@ namespace vk_forwarder
             // Add the outgoing message to local history
             secondTab.User.AddMessage(new VkNet.Model.Message()
             {
-                Text = message.Text ?? message.Caption ?? string.Empty,
+                Text = message.Text ?? message.Caption ?? (vkAttachments.Count > 0 ? "[Ваши вложения]" : string.Empty),
                 FromId = message.From?.Id ?? 0
             });
 
@@ -286,7 +286,7 @@ namespace vk_forwarder
             var firstTab = FirstTabs.FirstOrDefault(t => t.User.UserId == secondTab.User.UserId);
             if (firstTab != null) 
             {
-                string newDescription = $"👀{firstTab.User.FirstName} {firstTab.User.LastName}: Прочитано";
+                string newDescription = $"✔️{firstTab.User.FirstName} {firstTab.User.LastName}: Прочитано";
                 if (firstTab.Description != newDescription) 
                 {
                     firstTab.Description = newDescription;
@@ -537,8 +537,7 @@ namespace vk_forwarder
                                 {
                                     sentMsg = await botClient.SendDocument(
                                         chatId: TelegramService.GetTelegramId(),
-                                        document: new InputFileUrl(doc.Uri.ToString()),
-                                        caption: doc.Title ?? "Документ"
+                                        document: new InputFileUrl(doc.Uri.ToString())
                                     );
                                 }
                                 else

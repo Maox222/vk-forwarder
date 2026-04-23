@@ -53,7 +53,7 @@ namespace vk_forwarder
                 {
                     await TelegramService.GetTelegramBot().DeleteMessage(TelegramService.GetTelegramId(), TabId);
 
-                    Description = $"🆕{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
+                    Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
                     await MessageDispatcher.AddNewMessageToTelegram(this);
 
                 }

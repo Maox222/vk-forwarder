@@ -94,7 +94,7 @@ namespace vk_forwarder
                 FirstTab firstTab = new FirstTab()
                 {
                     User = new VkUser(userId, user.FirstName, user.LastName),
-                    Description = $"🆕{user?.FirstName} {user?.LastName}: У вас новое сообщение".Trim()
+                    Description = $"📨{user?.FirstName} {user?.LastName}: У вас новое сообщение".Trim()
                 };
                 firstTab.User.AddMessage(message);
                 await MessageDispatcher.AddNewMessageToTelegram(firstTab);
