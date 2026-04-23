@@ -284,9 +284,9 @@ namespace vk_forwarder
             if (secondTab == null) return;
 
             var firstTab = FirstTabs.FirstOrDefault(t => t.User.UserId == secondTab.User.UserId);
-            string newDescription = $"👀{firstTab.User.FirstName} {firstTab.User.LastName}: Прочитано";
             if (firstTab != null) 
             {
+                string newDescription = $"👀{firstTab.User.FirstName} {firstTab.User.LastName}: Прочитано";
                 if (firstTab.Description != newDescription) 
                 {
                     firstTab.Description = newDescription;
