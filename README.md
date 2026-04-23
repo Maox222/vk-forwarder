@@ -97,7 +97,7 @@ KillSignal=SIGINT
 User=ваше_имя
 Environment=TG_BOT_TOKEN=токен_бота               # @BotFather
 Environment=TG_ADMIN_ID=ваш_id                    # @Getmyid_bot
-Environment=VK_GROUP_TOKEN=токен_группы_вк        # Управление → Работа с API
+Environment=VK_GROUP_TOKEN=токен_вк               # Управление → (https://vkhost.github.io/)
 Environment=VK_GROUP_ID=id_группы_вк              # только цифры, без минуса
 
 [Install]
