@@ -12,7 +12,7 @@ KillSignal=SIGINT
 User=ваш_пользователь
 Environment=TG_BOT_TOKEN=Токен вашего бота телеграм -> @BotFather
 Environment=TG_ADMIN_ID=Ваш id -> можно узнать через @Getmyid_bot
-Environment=VK_GROUP_TOKEN=Токен вашей группы ВКонтакте -> Управление - Работа с API - Ключи доступа
+Environment=VK_GROUP_TOKEN=Токен ВКонтакте -> https://vkhost.github.io/ (Kate Mobile)
 Environment=VK_GROUP_ID=id вашей группы ВКонтакте (только цифры)
 
 [Install]
