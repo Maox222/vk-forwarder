@@ -19,6 +19,8 @@ namespace vk_forwarder
             
             api.Authorize(new ApiAuthParams
             {
+                Login = Environment.GetEnvironmentVariable("VK_LOGIN"),
+                Password = Environment.GetEnvironmentVariable("VK_PASSWORD"),
                 AccessToken = vkToken
             });
         }
