@@ -40,7 +40,7 @@
 * .NET 8 Runtime — на сервере
 * Иностранный VPS Ubuntu-сервер с SSH-доступом
 * Токен Telegram-бота (@BotFather)
-* Токен VK Kate Mobile - https://vkhost.github.io/
+* Токен Группы ВК
 
 ## Установка .NET 8 Runtime на сервере
 Подключитесь к вашему серверу по SSH (например, с помощью Putty или терминала) и выполните несколько подготовительных команд. Рекомендуется выполнять их от обычного пользователя, которого вы создали.
@@ -58,7 +58,8 @@ sudo apt install -y dotnet-runtime-8.0
 ## Настройка VK
 
 1. Откройте страницу группы → Управление → Работа с API → Ключи доступа
-2. Перейдите в Long Poll API → включите и добавьте событие "Входящие сообщения"
+2. Нажмите Создать ключ, выберите разрешение "Сообщения сообщества"
+3. Перейдите в Long Poll API → включите и добавьте событие "Входящие сообщения"
 
 ## Деплой на сервер
 1. Загрузка на сервер
@@ -97,10 +98,8 @@ KillSignal=SIGINT
 User=ваше_имя
 Environment=TG_BOT_TOKEN=токен_бота               # @BotFather
 Environment=TG_ADMIN_ID=ваш_id                    # @Getmyid_bot
-Environment=VK_GROUP_TOKEN=токен_вк               # Управление → (https://vkhost.github.io/)
+Environment=VK_GROUP_TOKEN=токен_группы_вк        # Управление → Работа с API
 Environment=VK_GROUP_ID=id_группы_вк              # только цифры, без минуса
-Environment=VK_LOGIN=Логин от ВК
-Environment=VK_PASSWORD=Пароль от ВК
 
 [Install]
 WantedBy=multi-user.target
