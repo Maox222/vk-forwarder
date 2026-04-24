@@ -1,5 +1,5 @@
-﻿using VkNet;
-using VkNet.Enums.Filters;
+using System.Threading.Channels;
+using VkNet;
 using VkNet.Enums.StringEnums;
 using VkNet.Model;
 
@@ -7,16 +7,21 @@ namespace vk_forwarder
 {
     internal class vkService
     {
-
         private static long? GroupId;
         private static VkApi api;
 
-        internal static void StartService(string vkToken, long? groupId) 
+        // Фоновая очередь: LongPoll цикл только пишет сюда, обработка идёт отдельно
+        private static readonly Channel<VkNet.Model.Message> _messageQueue =
+            Channel.CreateUnbounded<VkNet.Model.Message>(new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = false
+            });
+
+        internal static void StartService(string vkToken, long? groupId)
         {
             GroupId = groupId;
-
             api = new VkApi();
-            
             api.Authorize(new ApiAuthParams
             {
                 AccessToken = vkToken
@@ -25,6 +30,9 @@ namespace vk_forwarder
 
         internal static async Task StartListening(CancellationToken ct = default)
         {
+            // Запускаем воркер обработки сообщений параллельно с LongPoll циклом
+            var workerTask = Task.Run(() => ProcessMessageWorker(ct), ct);
+
             var longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
 
             while (!ct.IsCancellationRequested)
@@ -50,13 +58,15 @@ namespace vk_forwarder
                             var msg = (MessageNew)update.Instance;
                             var message = msg.Message;
                             if (message.Text != null && message.FromId != null)
-                                await ProcessNewMessage(message);
+                            {
+                                // Просто кладём в очередь — не ждём обработки
+                                _messageQueue.Writer.TryWrite(message);
+                            }
                         }
                     }
                 }
                 catch (VkNet.Exception.LongPollKeyExpiredException)
                 {
-                    // Код 2: ключ истёк — обновляем только key и ts
                     Console.WriteLine("[VK LongPoll] Ключ истёк, обновляем...");
                     var fresh = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
                     longPollServer.Key = fresh.Key;
@@ -64,15 +74,14 @@ namespace vk_forwarder
                 }
                 catch (VkNet.Exception.LongPollInfoLostException)
                 {
-                    // Код 3: история событий потеряна — обновляем всё целиком
+                    // Не вызываем DestroyAll — сообщения которые уже в очереди будут обработаны
                     Console.WriteLine("[VK LongPoll] История потеряна, переподключаемся...");
                     longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
                 }
                 catch (VkNet.Exception.LongPollOutdateException)
                 {
-                    // Ts устарел, - возникает при спаме сообщениями
-                    Console.WriteLine("[VK LongPoll] История событий устарела или была частично утеряна");
-                    await MessageDispatcher.DestroyAll();
+                    // Ts устарел при спаме — просто обновляем сервер, состояние не трогаем
+                    Console.WriteLine("[VK LongPoll] Ts устарел, обновляем сервер...");
                     longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
                 }
                 catch (OperationCanceledException)
@@ -85,32 +94,58 @@ namespace vk_forwarder
                     await Task.Delay(5000, ct);
                 }
 
-                await Task.Delay(1000, ct);
+                // Убираем Task.Delay(1000) — при спаме это лишняя задержка.
+                // Wait=25 в LongPoll уже даёт естественную паузу когда событий нет.
+            }
+
+            _messageQueue.Writer.Complete();
+            await workerTask;
+        }
+
+        /// <summary>
+        /// Фоновый воркер: читает сообщения из очереди и обрабатывает их одно за другим.
+        /// Изолирует медленные операции (Users.Get, отправка в Telegram) от LongPoll цикла.
+        /// </summary>
+        private static async Task ProcessMessageWorker(CancellationToken ct)
+        {
+            await foreach (var message in _messageQueue.Reader.ReadAllAsync(ct))
+            {
+                try
+                {
+                    await ProcessNewMessage(message);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[VK Worker] Ошибка при обработке сообщения: {ex.Message}");
+                }
             }
         }
 
         private static async Task ProcessNewMessage(VkNet.Model.Message message)
         {
-            var userMessage = message.Text;
             var userId = (long)message.FromId;
-            var user = api.Users.Get(new long[] { userId }).FirstOrDefault();
 
+            var existingTab = MessageDispatcher.FirstTabs.FirstOrDefault(tbs => tbs.User.UserId == userId);
 
-            if (!MessageDispatcher.FirstTabs.Any(tbs => tbs.User.UserId == userId))
+            if (existingTab == null)
             {
+                // Получаем имя пользователя только при первом сообщении — не при каждом
+                var user = api.Users.Get(new long[] { userId }).FirstOrDefault();
+
                 FirstTab firstTab = new FirstTab()
                 {
-                    User = new VkUser(userId, user.FirstName, user.LastName)
+                    User = new VkUser(userId, user?.FirstName ?? "Неизвестный", user?.LastName ?? "")
                 };
-                // AddMessage triggers Messages_CollectionChanged which calls AddNewMessageToTelegram internally
                 firstTab.User.AddMessage(message);
             }
-            else 
+            else
             {
-                FirstTab firstTab = MessageDispatcher.FirstTabs.First(tbs => tbs.User.UserId == userId);
-                firstTab.User.AddMessage(message);
+                existingTab.User.AddMessage(message);
             }
-
         }
 
         internal static VkApi GetVkApi() => api;

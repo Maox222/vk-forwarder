@@ -76,7 +76,7 @@ namespace vk_forwarder
                 Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
                 await MessageDispatcher.AddNewMessageToTelegram(this);
             }
-            else if (MessageDispatcher.SecondTabs.Count > 0 && TabId != 0)
+            else if (MessageDispatcher.SecondTabs.Count > 0 && TabId != 0 && User.UserId != MessageDispatcher.SecondTabs.FirstOrDefault().User?.UserId)
             {
                 // SecondTab is open (with a different user) and this FirstTab already exists —
                 // mark as pending so FlushPendingFirstTabs will delete+resend it on back press
