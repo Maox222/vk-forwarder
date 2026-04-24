@@ -36,7 +36,6 @@ namespace vk_forwarder
             if (SecondTabs.Count > 0)
             {
                 _pendingFirstTabs.Enqueue(firstTab);
-                //Console.WriteLine($"[Queue] Диалог с {firstTab.User.FirstName} поставлен в очередь (SecondTab открыт).");
                 return;
             }
 
@@ -67,19 +66,107 @@ namespace vk_forwarder
 
         /// <summary>
         /// Called when a SecondTab is closed (back button pressed) to flush the queue.
+        /// Skips tabs whose user already has an active FirstTab — just updates the description instead.
         /// </summary>
         private static async Task FlushPendingFirstTabs()
         {
-            while (_pendingFirstTabs.Count > 0)
+            // Send queued tabs for users who wrote for the first time while SecondTab was open
+            var deduplicated = _pendingFirstTabs
+                .GroupBy(t => t.User.UserId)
+                .Select(g =>
+                {
+                    var toDispose = g.SkipLast(1).ToList();
+                    foreach (var old in toDispose) old.Dispose();
+                    return g.Last();
+                })
+                .ToList();
+            _pendingFirstTabs.Clear();
+
+            foreach (var tab in deduplicated)
             {
-                var tab = _pendingFirstTabs.Dequeue();
+                // If a FirstTab for this user already exists — delete old and resend for notification
+                var existing = FirstTabs.FirstOrDefault(t => t.User.UserId == tab.User.UserId);
+                if (existing != null)
+                {
+                    try
+                    {
+                        existing.Description = tab.Description;
+                        var chatId = TelegramService.GetTelegramId();
+
+                        await botClient.DeleteMessage(chatId, existing.TabId);
+
+                        var sent = await botClient.SendMessage(
+                            chatId,
+                            text: existing.Description,
+                            replyMarkup: existing.GetInlineKeyboard()
+                        );
+                        existing.TabId = sent.MessageId;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[FlushPending] Не удалось обновить существующий FirstTab: {ex.Message}");
+                    }
+
+                    // Dispose only if it's a different object (a newly created tab for an already-existing user).
+                    // If tab IS existing (same reference — queued from FirstTab.Messages_CollectionChanged),
+                    // don't dispose it or we'll kill the live tab.
+                    if (!ReferenceEquals(tab, existing))
+                        tab.Dispose();
+                    continue;
+                }
+
                 await SendFirstTabNow(tab);
             }
         }
 
         // ──────────────────────────────────────────────────────────────────
-        //  Sending a message back to VK (text + optional Telegram attachments)
+        //  Full reset
         // ──────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Deletes all bot messages from Telegram and clears every in-memory collection.
+        /// Call on unrecoverable LongPoll errors so the state doesn't go stale.
+        /// </summary>
+        internal static async Task DestroyAll()
+        {
+            var chatId = TelegramService.GetTelegramId();
+
+            // Collect all unique FirstTab instances across FirstTabs + pending queue.
+            // _pendingFirstTabs may hold references to objects already in FirstTabs
+            // (queued via FirstTab.Messages_CollectionChanged while a SecondTab was open),
+            // so we deduplicate by reference to avoid double-dispose.
+            var allFirstTabs = new HashSet<FirstTab>(ReferenceEqualityComparer.Instance);
+            foreach (var t in FirstTabs) allFirstTabs.Add(t);
+            foreach (var t in _pendingFirstTabs) allFirstTabs.Add(t);
+
+            // 1. SecondTabs — delete SecondTab Telegram message + all tracked bot messages.
+            //    Dispose unsubscribes SecondTab's Messages_CollectionChanged.
+            //    The corresponding FirstTab is handled below.
+            foreach (var secondTab in SecondTabs.ToList())
+            {
+                try { await secondTab.DeleteAllBotMessages(); } catch { }
+                try { await botClient.DeleteMessage(chatId, secondTab.TabId); } catch { }
+                secondTab.Dispose();
+            }
+            SecondTabs.Clear();
+
+            // 2. All unique FirstTabs (including pending) — delete Telegram messages,
+            //    then dispose to unsubscribe Messages_CollectionChanged.
+            //    TabId == 0 means it was queued but never sent — skip delete for those.
+            foreach (var firstTab in allFirstTabs)
+            {
+                if (firstTab.TabId != 0)
+                    try { await botClient.DeleteMessage(chatId, firstTab.TabId); } catch { }
+
+                firstTab.Dispose();
+            }
+            FirstTabs.Clear();
+            _pendingFirstTabs.Clear();
+
+            Console.WriteLine("[DestroyAll] Все вкладки и сообщения удалены.");
+        }
+
+
 
         internal static async void AddNewMessageToVk(
             ITelegramBotClient botClient,
@@ -251,16 +338,16 @@ namespace vk_forwarder
             var firstTab = FirstTabs.FirstOrDefault(t => t.TabId == messageId);
             if (firstTab == null) return;
 
-            var secondTab = new SecondTab(firstTab.User);
-
-            string chatText = SecondTab.BuildChatHistoryText(firstTab.User.Messages, firstTab.User.UserId);
-            firstTab.User.ChatHistory = chatText;
-
             try
             {
+                var secondTab = new SecondTab(firstTab.User)
+                {
+                    MessageCountOnOpen = firstTab.User.Messages.Count
+                };
+
                 var sentMessage = await botClient.SendMessage(
                     chatId: TelegramService.GetTelegramId(),
-                    text: chatText,
+                    text: firstTab.User.ChatHistory,
                     replyMarkup: secondTab.GetInlineKeyboard(),
                     linkPreviewOptions: new LinkPreviewOptions { IsDisabled = true }
                 );
@@ -284,19 +371,44 @@ namespace vk_forwarder
             if (secondTab == null) return;
 
             var firstTab = FirstTabs.FirstOrDefault(t => t.User.UserId == secondTab.User.UserId);
-            if (firstTab != null) 
+            if (firstTab != null)
             {
-                string newDescription = $"✔️{firstTab.User.FirstName} {firstTab.User.LastName}: Прочитано";
-                if (firstTab.Description != newDescription) 
+                bool newMessagesArrived = firstTab.User.Messages.Count > secondTab.MessageCountOnOpen;
+
+                if (newMessagesArrived)
                 {
-                    firstTab.Description = newDescription;
+                    // New messages came in while dialog was open — delete+resend for push notification
                     try
                     {
-                        await botClient.EditMessageText(TelegramService.GetTelegramId(), firstTab.TabId, firstTab.Description, replyMarkup: firstTab.GetInlineKeyboard());
+                        firstTab.Description = $"📨{firstTab.User.FirstName} {firstTab.User.LastName}: У вас новое сообщение".Trim();
+                        await botClient.DeleteMessage(TelegramService.GetTelegramId(), firstTab.TabId);
+                        var sent = await botClient.SendMessage(
+                            TelegramService.GetTelegramId(),
+                            text: firstTab.Description,
+                            replyMarkup: firstTab.GetInlineKeyboard()
+                        );
+                        firstTab.TabId = sent.MessageId;
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Ошибка при возврате к FirstTab и редактировании FirstTab Description: {ex.Message}");
+                        Console.WriteLine($"Ошибка при resend FirstTab после новых сообщений: {ex.Message}");
+                    }
+                }
+                else
+                {
+                    // No new messages — just mark as read
+                    string newDescription = $"✔️{firstTab.User.FirstName} {firstTab.User.LastName}: Прочитано";
+                    if (firstTab.Description != newDescription)
+                    {
+                        firstTab.Description = newDescription;
+                        try
+                        {
+                            await botClient.EditMessageText(TelegramService.GetTelegramId(), firstTab.TabId, firstTab.Description, replyMarkup: firstTab.GetInlineKeyboard());
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Ошибка при редактировании FirstTab на Прочитано: {ex.Message}");
+                        }
                     }
                 }
             }

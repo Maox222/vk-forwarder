@@ -48,20 +48,42 @@ namespace vk_forwarder
 
             if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0)
             {
-
+                // SecondTab closed, tab already sent — delete old and resend to trigger a push notification
                 try
                 {
-                    await TelegramService.GetTelegramBot().DeleteMessage(TelegramService.GetTelegramId(), TabId);
+                    var bot = TelegramService.GetTelegramBot();
+                    var chatId = TelegramService.GetTelegramId();
 
                     Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
-                    await MessageDispatcher.AddNewMessageToTelegram(this);
 
+                    await bot.DeleteMessage(chatId, TabId);
+
+                    var sent = await bot.SendMessage(
+                        chatId,
+                        text: Description,
+                        replyMarkup: GetInlineKeyboard()
+                    );
+                    TabId = sent.MessageId;
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Не удалось обновить сообщение в 1 блоке: {ex.Message}");
                 }
             }
+            else if (TabId == 0)
+            {
+                // Tab not yet sent — pass to dispatcher which will queue it if SecondTab is open
+                Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
+                await MessageDispatcher.AddNewMessageToTelegram(this);
+            }
+            else if (MessageDispatcher.SecondTabs.Count > 0 && TabId != 0)
+            {
+                // SecondTab is open (with a different user) and this FirstTab already exists —
+                // mark as pending so FlushPendingFirstTabs will delete+resend it on back press
+                Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
+                await MessageDispatcher.AddNewMessageToTelegram(this);
+            }
+
         }
 
         /// <summary>
@@ -160,6 +182,12 @@ namespace vk_forwarder
         /// </summary>
         public bool IsAwaitingAttachmentIndex { get; set; } = false;
 
+        /// <summary>
+        /// Number of messages when this SecondTab was opened.
+        /// Used to detect new messages that arrived while the dialog was open.
+        /// </summary>
+        public int MessageCountOnOpen { get; set; }
+
         private bool _disposed = false;
 
         public SecondTab(VkUser user)
@@ -201,6 +229,10 @@ namespace vk_forwarder
                 return;
             }
 
+            // Update chat history text
+            var allText = BuildChatHistoryText(User.Messages, User.UserId);
+            User.ChatHistory = allText;
+
             try
             {
                 var bot = TelegramService.GetTelegramBot();
@@ -213,6 +245,11 @@ namespace vk_forwarder
                     replyMarkup: GetInlineKeyboard(),
                     linkPreviewOptions: new LinkPreviewOptions { IsDisabled = true }
                 );
+
+                // Сообщения отображены в открытом диалоге — считаем прочитанными.
+                // HandleBack проверяет MessageCountOnOpen, чтобы решить "новые или нет":
+                // раз мы уже показали все сообщения, обновляем счётчик.
+                MessageCountOnOpen = User.Messages.Count;
             }
             catch (Exception ex)
             {

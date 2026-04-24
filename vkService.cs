@@ -68,6 +68,13 @@ namespace vk_forwarder
                     Console.WriteLine("[VK LongPoll] История потеряна, переподключаемся...");
                     longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
                 }
+                catch (VkNet.Exception.LongPollOutdateException)
+                {
+                    // Ts устарел, - возникает при спаме сообщениями
+                    Console.WriteLine("[VK LongPoll] История событий устарела или была частично утеряна");
+                    await MessageDispatcher.DestroyAll();
+                    longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
+                }
                 catch (OperationCanceledException)
                 {
                     break;
@@ -78,7 +85,7 @@ namespace vk_forwarder
                     await Task.Delay(5000, ct);
                 }
 
-                await Task.Delay(2000, ct);
+                await Task.Delay(1000, ct);
             }
         }
 
@@ -93,11 +100,10 @@ namespace vk_forwarder
             {
                 FirstTab firstTab = new FirstTab()
                 {
-                    User = new VkUser(userId, user.FirstName, user.LastName),
-                    Description = $"📨{user?.FirstName} {user?.LastName}: У вас новое сообщение".Trim()
+                    User = new VkUser(userId, user.FirstName, user.LastName)
                 };
+                // AddMessage triggers Messages_CollectionChanged which calls AddNewMessageToTelegram internally
                 firstTab.User.AddMessage(message);
-                await MessageDispatcher.AddNewMessageToTelegram(firstTab);
             }
             else 
             {
