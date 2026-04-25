@@ -43,7 +43,7 @@ namespace vk_forwarder
         internal async virtual void Messages_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
         {
             if (_disposed) return;
-            var allText = BuildChatHistoryText(User.Messages, User.UserId);
+            var allText = BuildChatHistoryText(User.Messages, User.UserId, User.FirstName, User.LastName);
             User.ChatHistory = allText;
 
             if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0)
@@ -89,16 +89,14 @@ namespace vk_forwarder
         /// <summary>
         /// Builds numbered chat history with "вы" / "ваш собеседник" labels and [вложения] markers.
         /// </summary>
-        internal static string BuildChatHistoryText(
-    ObservableCollection<VkNet.Model.Message> messages,
-    long ownerId)
+        internal static string BuildChatHistoryText(ObservableCollection<VkNet.Model.Message> messages, long ownerId, string firstName, string lastName)
         {
             var sb = new StringBuilder();
             for (int i = 0; i < messages.Count; i++)
             {
                 var m = messages[i];
                 bool isOwn = m.FromId != ownerId;
-                string label = isOwn ? "\tВы\t" : "\tВаш собеседник\t";
+                string label = isOwn ? "\tВы\t" : $"\t{firstName} {lastName}\t";
 
                 sb.AppendLine($"[{label}]");
                 AppendMessageWithNested(sb, m, i + 1, indentLevel: 0);
@@ -206,15 +204,15 @@ namespace vk_forwarder
             {
                 return new InlineKeyboardMarkup(new[]
                 {
-                    new[] { InlineKeyboardButton.WithCallbackData("Посмотреть вложения", "words:check_attachment"), 
-                        InlineKeyboardButton.WithCallbackData("Назад", "words:back") }
+                    new[] { InlineKeyboardButton.WithCallbackData("📎 Вложения", "words:check_attachment"), 
+                        InlineKeyboardButton.WithCallbackData("🔙 Назад", "words:back") }
                 });
             }
             else
             {
                 return new InlineKeyboardMarkup(new[]
                 {
-                    new[] { InlineKeyboardButton.WithCallbackData("Назад", "words:back") }
+                    new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", "words:back") }
                 });
             }
         }
@@ -230,7 +228,7 @@ namespace vk_forwarder
             }
 
             // Update chat history text
-            var allText = BuildChatHistoryText(User.Messages, User.UserId);
+            var allText = BuildChatHistoryText(User.Messages, User.UserId, User.FirstName, User.LastName);
             User.ChatHistory = allText;
 
             try

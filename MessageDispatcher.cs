@@ -144,10 +144,13 @@ namespace vk_forwarder
                 Console.WriteLine($"[VK] Ошибка при загрузке вложений: {ex.Message}");
             }
 
+            var text = new StringBuilder (message.Text ?? message.Caption ?? string.Empty);
+            if (vkAttachments.Count > 0) text.Append("\n [Ваши вложения]");
+
             // Add the outgoing message to local history
             secondTab.User.AddMessage(new VkNet.Model.Message()
             {
-                Text = message.Text ?? message.Caption ?? (vkAttachments.Count > 0 ? "[Ваши вложения]" : string.Empty),
+                Text = text.ToString(),
                 FromId = message.From?.Id ?? 0
             });
 
@@ -433,7 +436,7 @@ namespace vk_forwarder
                     chatId: TelegramService.GetTelegramId(),
                     text: "Вложений нет."
                 );
-                secondTab.BotMessageIds.Add(noAttMsg.MessageId);
+                TrackAndAutoDelete(secondTab, noAttMsg.MessageId);
                 return;
             }
 
@@ -492,7 +495,7 @@ namespace vk_forwarder
                     chatId: TelegramService.GetTelegramId(),
                     text: $"⚠️ Сообщение с номером {messageIndex + 1} не найдено."
                 );
-                secondTab.BotMessageIds.Add(errMsg.MessageId);
+                TrackAndAutoDelete(secondTab, errMsg.MessageId);
                 return;
             }
 
@@ -508,7 +511,7 @@ namespace vk_forwarder
                     chatId: TelegramService.GetTelegramId(),
                     text: $"В сообщении №{messageIndex + 1} нет вложений (включая пересланные и ответные)."
                 );
-                secondTab.BotMessageIds.Add(noAttMsg.MessageId);
+                TrackAndAutoDelete(secondTab, noAttMsg.MessageId);
                 return;
             }
 
@@ -786,7 +789,7 @@ namespace vk_forwarder
             {
                 var backKeyboard = new InlineKeyboardMarkup(new[]
                 {
-            new[] { InlineKeyboardButton.WithCallbackData("Назад", $"words:back_attachments:{tabMessageId}") }
+            new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", $"words:back_attachments:{tabMessageId}") }
         });
 
                 string sourceInfo = "";
@@ -818,6 +821,161 @@ namespace vk_forwarder
             if (secondTab == null) return;
 
             await secondTab.DeleteAllBotMessages();
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        //  Auto-delete helper
+        // ──────────────────────────────────────────────────────────────────
+
+        private const int AutoDeleteSeconds = 10;
+
+        /// <summary>
+        /// Tracks <paramref name="messageId"/> in <paramref name="secondTab"/>.BotMessageIds
+        /// and schedules its automatic deletion after <see cref="AutoDeleteSeconds"/> seconds.
+        /// If the message is already deleted before the timer fires (e.g. via "Закрыть" or "Назад"),
+        /// the timer just silently catches the Telegram exception and exits.
+        /// </summary>
+        private static void TrackAndAutoDelete(SecondTab secondTab, int messageId)
+        {
+            if (secondTab != null)
+                secondTab.BotMessageIds.Add(messageId);
+
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(AutoDeleteSeconds));
+                await AutoDeleteMessage(secondTab, messageId);
+            });
+        }
+
+        private static async Task AutoDeleteMessage(SecondTab secondTab, int messageId)
+        {
+            // Guard: if already removed from tracking (deleted manually), nothing to do
+            if (secondTab != null) 
+            {
+                if (!secondTab.BotMessageIds.Contains(messageId)) return;
+
+                secondTab.BotMessageIds.Remove(messageId);
+            }
+
+            var bot = TelegramService.GetTelegramBot();
+            var chatId = TelegramService.GetTelegramId();
+            try { await bot.DeleteMessage(chatId, messageId); } catch { }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        //  /copy command handler
+        // ──────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Handles the /copy command sent by the admin in Telegram while a SecondTab is open.
+        /// <br/>
+        /// Supported forms:
+        /// <list type="bullet">
+        ///   <item><c>/copy &lt;N&gt;</c> — sends the plain text of message number N back to the admin.</item>
+        ///   <item><c>/copy link</c>      — sends a vk.com profile link for the current interlocutor.</item>
+        /// </list>
+        /// The command message itself is deleted after processing so it doesn't pollute the chat.
+        /// All result messages auto-delete after <see cref="AutoDeleteSeconds"/> seconds,
+        /// and can also be closed early via the "✖ Закрыть" button.
+        /// </summary>
+        internal static async Task HandleCopyCommand(
+            ITelegramBotClient bot,
+            global::Telegram.Bot.Types.Message message)
+        {
+            var chatId = TelegramService.GetTelegramId();
+            var secondTab = SecondTabs.FirstOrDefault();
+
+            // Always delete the /copy command message first
+            try { await bot.DeleteMessage(chatId, message.MessageId); } catch { }
+
+            if (secondTab == null)
+            {
+                var warn = await bot.SendMessage(chatId, "⚠️ Команда /copy доступна только в открытом диалоге.");
+                TrackAndAutoDelete(secondTab, warn.MessageId);
+                return;
+            }
+
+            // Parse argument — everything after "/copy "
+            var text = message.Text ?? string.Empty;
+            var arg = text.Length > 5 ? text.Substring(5).Trim() : string.Empty;
+
+            if (string.IsNullOrEmpty(arg))
+            {
+                var warn = await bot.SendMessage(chatId, "⚠️ Укажи номер сообщения или 'link'.\nПример: /copy 3  или  /copy link");
+                TrackAndAutoDelete(secondTab, warn.MessageId);
+                return;
+            }
+
+            // ── /copy link ────────────────────────────────────────────────
+            if (arg.Equals("link", StringComparison.OrdinalIgnoreCase))
+            {
+                var link = $"https://vk.com/id{secondTab.User.UserId}";
+                var sent = await bot.SendMessage(
+                    chatId,
+                    text: link,
+                    replyMarkup: MakeCloseKeyboard(0), // placeholder, updated below
+                    linkPreviewOptions: new LinkPreviewOptions { IsDisabled = true }
+                );
+                // Update keyboard with the real message id so the callback can delete it early
+                await bot.EditMessageReplyMarkup(chatId, sent.MessageId, MakeCloseKeyboard(sent.MessageId));
+                secondTab.BotMessageIds.Add(sent.MessageId);
+                return;
+            }
+
+            // ── /copy <N> ─────────────────────────────────────────────────
+            if (!int.TryParse(arg, out int index) || index < 1)
+            {
+                var warn = await bot.SendMessage(chatId, "⚠️ Неверный аргумент. Укажи номер сообщения (число) или 'link'.");
+                TrackAndAutoDelete(secondTab, warn.MessageId);
+                return;
+            }
+
+            var messages = secondTab.User.Messages;
+            if (index > messages.Count)
+            {
+                var warn = await bot.SendMessage(chatId, $"⚠️ Сообщение №{index} не найдено. В диалоге {messages.Count} сообщений.");
+                TrackAndAutoDelete(secondTab, warn.MessageId);
+                return;
+            }
+
+            var target = messages[index - 1];
+            var msgText = target.Text ?? string.Empty;
+
+            if (string.IsNullOrWhiteSpace(msgText))
+            {
+                var warn = await bot.SendMessage(chatId, $"⚠️ Сообщение №{index} не содержит текста.");
+                TrackAndAutoDelete(secondTab, warn.MessageId);
+                return;
+            }
+
+            var result = await bot.SendMessage(chatId, msgText, replyMarkup: MakeCloseKeyboard(0));
+            await bot.EditMessageReplyMarkup(chatId, result.MessageId, MakeCloseKeyboard(result.MessageId));
+            secondTab.BotMessageIds.Add(result.MessageId);
+        }
+
+        /// <summary>
+        /// Builds the "✖ Закрыть" keyboard for /copy results.
+        /// The callback carries the message id so it can be deleted without touching SecondTab.
+        /// </summary>
+        private static InlineKeyboardMarkup MakeCloseKeyboard(int messageId) =>
+            new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("✖ Закрыть", $"words:close_copy:{messageId}") }
+            });
+
+        /// <summary>
+        /// Deletes a single /copy result message immediately (triggered by "✖ Закрыть" button).
+        /// Cancels the pending auto-delete by removing the id from BotMessageIds first.
+        /// </summary>
+        internal static async Task HandleCloseCopy(int messageId)
+        {
+            var secondTab = SecondTabs.FirstOrDefault();
+            // Removing from BotMessageIds prevents AutoDeleteMessage from firing again
+            secondTab?.BotMessageIds.Remove(messageId);
+
+            var bot = TelegramService.GetTelegramBot();
+            var chatId = TelegramService.GetTelegramId();
+            try { await bot.DeleteMessage(chatId, messageId); } catch { }
         }
     }
 }

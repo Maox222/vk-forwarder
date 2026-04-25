@@ -97,6 +97,12 @@ namespace vk_forwarder.Telegram
                 if (int.TryParse(data.Split(':')[2], out int tabMsgId))
                     await MessageDispatcher.HandleBackFromAttachments(tabMsgId);
             }
+            else if (data.StartsWith("words:close_copy:"))
+            {
+                // data format: "words:close_copy:<messageId>"
+                if (int.TryParse(data.Split(':')[2], out int msgId))
+                    await MessageDispatcher.HandleCloseCopy(msgId);
+            }
             else if (data == "words:delete")
             {
                 await HandleDelete(messageId);
@@ -122,6 +128,13 @@ namespace vk_forwarder.Telegram
                               || message.Sticker != null;
 
             if (!hasContent) return;
+
+            // Handle /copy command — intercept before forwarding to VK
+            if ((message.Text ?? string.Empty).StartsWith("/copy", StringComparison.OrdinalIgnoreCase))
+            {
+                _ = MessageDispatcher.HandleCopyCommand(bot, message);
+                return;
+            }
 
             // If a SecondTab is open AND reply mode is active → forward to VK
             var activeSecondTab = MessageDispatcher.SecondTabs.FirstOrDefault();
