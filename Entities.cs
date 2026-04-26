@@ -313,7 +313,7 @@ namespace vk_forwarder
 
             if (foundMessage != null)
             {
-                foundMessage.Text = message.Text + "(редакт.)" ?? string.Empty;
+                foundMessage.Text = message.Text + " (ред.)" ?? string.Empty;
                 if (message.Attachments.Count > 0) foundMessage.Attachments = message.Attachments;
 
                 int index = Messages.IndexOf(foundMessage);
