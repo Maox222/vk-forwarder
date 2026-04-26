@@ -135,6 +135,11 @@ namespace vk_forwarder.Telegram
                 _ = MessageDispatcher.HandleCopyCommand(bot, message);
                 return;
             }
+            if ((message.Text ?? string.Empty).StartsWith("/delete", StringComparison.OrdinalIgnoreCase))
+            {
+                _ = MessageDispatcher.HandleDeleteCommand(bot, message);
+                return;
+            }
 
             // If a SecondTab is open AND reply mode is active → forward to VK
             var activeSecondTab = MessageDispatcher.SecondTabs.FirstOrDefault();

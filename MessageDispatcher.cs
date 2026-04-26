@@ -72,7 +72,7 @@ namespace vk_forwarder
         {
             // Send queued tabs for users who wrote for the first time while SecondTab was open
             var deduplicated = _pendingFirstTabs
-                .GroupBy(t => t.User.UserId)
+                .GroupBy(t => t.User.PeerId)
                 .Select(g =>
                 {
                     var toDispose = g.SkipLast(1).ToList();
@@ -85,7 +85,7 @@ namespace vk_forwarder
             foreach (var tab in deduplicated)
             {
                 // If a FirstTab for this user already exists — delete old and resend for notification
-                var existing = FirstTabs.FirstOrDefault(t => t.User.UserId == tab.User.UserId);
+                var existing = FirstTabs.FirstOrDefault(t => t.User.PeerId == tab.User.PeerId);
                 if (existing != null)
                 {
                     try
@@ -137,7 +137,7 @@ namespace vk_forwarder
 
             try
             {
-                vkAttachments = await UploadTelegramAttachmentsToVk(botClient, message, secondTab.User.UserId);
+                vkAttachments = await UploadTelegramAttachmentsToVk(botClient, message, secondTab.User.PeerId);
             }
             catch (Exception ex)
             {
@@ -151,22 +151,22 @@ namespace vk_forwarder
             secondTab.User.AddMessage(new VkNet.Model.Message()
             {
                 Text = text.ToString(),
-                FromId = message.From?.Id ?? 0
+                FromId = message.From?.Id ?? 0,
             });
 
             try
             {
                 var sendParams = new VkNet.Model.MessagesSendParams()
                 {
-                    UserId = secondTab.User.UserId,
+                    PeerId = secondTab.User.PeerId,
                     RandomId = new Random().Next(),
                     Message = message.Text ?? message.Caption ?? string.Empty
                 };
-
+                
                 if (vkAttachments.Count > 0)
                     sendParams.Attachments = vkAttachments;
 
-                vkService.GetVkApi().Messages.Send(sendParams);
+                secondTab.User.Messages.Last().Id = vkService.GetVkApi().Messages.Send(sendParams);
             }
             catch (Exception ex)
             {
@@ -324,7 +324,7 @@ namespace vk_forwarder
             var secondTab = SecondTabs.FirstOrDefault(t => t.TabId == messageId);
             if (secondTab == null) return;
 
-            var firstTab = FirstTabs.FirstOrDefault(t => t.User.UserId == secondTab.User.UserId);
+            var firstTab = FirstTabs.FirstOrDefault(t => t.User.PeerId == secondTab.User.PeerId);
             if (firstTab != null)
             {
                 // No new messages — just mark as read
@@ -909,7 +909,7 @@ namespace vk_forwarder
             // ── /copy link ────────────────────────────────────────────────
             if (arg.Equals("link", StringComparison.OrdinalIgnoreCase))
             {
-                var link = $"https://vk.com/id{secondTab.User.UserId}";
+                var link = $"https://vk.com/id{secondTab.User.PeerId}";
                 var sent = await bot.SendMessage(
                     chatId,
                     text: link,
@@ -951,6 +951,85 @@ namespace vk_forwarder
             var result = await bot.SendMessage(chatId, msgText, replyMarkup: MakeCloseKeyboard(0));
             await bot.EditMessageReplyMarkup(chatId, result.MessageId, MakeCloseKeyboard(result.MessageId));
             secondTab.BotMessageIds.Add(result.MessageId);
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        //  /delete command handler
+        // ──────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Handles the /delete &lt;N&gt; command while a SecondTab is open.
+        /// Deletes message number N from VK via Messages.Delete,
+        /// removes it from the in-memory collection and rebuilds ChatHistory.
+        /// </summary>
+        internal static async Task HandleDeleteCommand(
+            ITelegramBotClient bot,
+            global::Telegram.Bot.Types.Message message)
+        {
+            var chatId = TelegramService.GetTelegramId();
+            var secondTab = SecondTabs.FirstOrDefault();
+
+            // Delete the /delete command message immediately
+            try { await bot.DeleteMessage(chatId, message.MessageId); } catch { }
+
+            if (secondTab == null)
+            {
+                var warn = await bot.SendMessage(chatId, "⚠️ Команда /delete доступна только в открытом диалоге.");
+                await Task.Delay(3000);
+                try { await bot.DeleteMessage(chatId, warn.MessageId); } catch { }
+                return;
+            }
+
+            // Parse argument — everything after "/delete "
+            var text = message.Text ?? string.Empty;
+            var arg = text.Length > 7 ? text.Substring(7).Trim() : string.Empty;
+
+            if (string.IsNullOrEmpty(arg) || !int.TryParse(arg, out int index) || index < 1)
+            {
+                var warn = await bot.SendMessage(chatId, "⚠️ Укажи номер сообщения.\nПример: /delete 3");
+                TrackAndAutoDelete(secondTab, warn.MessageId);
+                return;
+            }
+
+            var messages = secondTab.User.Messages;
+            if (index > messages.Count)
+            {
+                var warn = await bot.SendMessage(chatId, $"⚠️ Сообщение №{index} не найдено. В диалоге {messages.Count} сообщений.");
+                TrackAndAutoDelete(secondTab, warn.MessageId);
+                return;
+            }
+
+            var target = messages[index - 1];
+            var vkMessageId = target.Id;
+
+            if (vkMessageId == null)
+            {
+                var warn = await bot.SendMessage(chatId, $"⚠️ Не удалось получить ID сообщения №{index} в VK.");
+                TrackAndAutoDelete(secondTab, warn.MessageId);
+                return;
+            }
+
+            // Delete from VK
+            try
+            {
+                var api = vkService.GetVkApi();
+                var success = api.Messages.Delete(
+                    messageIds: new ulong[] { (ulong)vkMessageId.Value },
+                    deleteForAll: true,
+                    groupId: (ulong?)vkService.GetGroupId());
+            }
+            catch (Exception ex)
+            {
+                var warn = await bot.SendMessage(chatId, $"⚠️ Не удалось удалить сообщение в VK: {ex.Message}");
+                TrackAndAutoDelete(secondTab, warn.MessageId);
+                return;
+            }
+
+            // Remove from in-memory collection — CollectionChanged will rebuild ChatHistory automatically
+            messages.Remove(target);
+
+            var ok = await bot.SendMessage(chatId, $"✅ Сообщение №{index} удалено.");
+            TrackAndAutoDelete(secondTab, ok.MessageId);
         }
 
         /// <summary>

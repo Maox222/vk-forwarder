@@ -43,10 +43,10 @@ namespace vk_forwarder
         internal async virtual void Messages_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
         {
             if (_disposed) return;
-            var allText = BuildChatHistoryText(User.Messages, User.UserId, User.FirstName, User.LastName);
+            var allText = BuildChatHistoryText(User.Messages, User.PeerId, User.FirstName, User.LastName);
             User.ChatHistory = allText;
 
-            if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0)
+            if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0 && User.Messages[e.NewStartingIndex].AdminAuthorId == null)
             {
                 // SecondTab closed, tab already sent — delete old and resend to trigger a push notification
                 try
@@ -70,13 +70,14 @@ namespace vk_forwarder
                     Console.WriteLine($"Не удалось обновить сообщение в 1 блоке: {ex.Message}");
                 }
             }
-            else if (TabId == 0)
+            else if (TabId == 0 && User.Messages[e.NewStartingIndex].AdminAuthorId == null)
             {
                 // Tab not yet sent — pass to dispatcher which will queue it if SecondTab is open
                 Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
                 await MessageDispatcher.AddNewMessageToTelegram(this);
             }
-            else if (MessageDispatcher.SecondTabs.Count > 0 && TabId != 0 && User.UserId != MessageDispatcher.SecondTabs.FirstOrDefault().User?.UserId)
+            else if (MessageDispatcher.SecondTabs.Count > 0 && TabId != 0 && User.PeerId != MessageDispatcher.SecondTabs.FirstOrDefault().User?.PeerId
+                && User.Messages[e.NewStartingIndex].AdminAuthorId == null)
             {
                 // SecondTab is open (with a different user) and this FirstTab already exists —
                 // mark as pending so FlushPendingFirstTabs will delete+resend it on back press
@@ -195,7 +196,6 @@ namespace vk_forwarder
 
         public override InlineKeyboardMarkup GetInlineKeyboard()
         {
-            User.CountOfChange = 0;
 
             var hasAttachments = User.Messages.Any(m => m.Attachments != null && m.Attachments.Count > 0 
             || m.ForwardedMessages != null && m.ForwardedMessages.Count > 0 || m.ReplyMessage != null);
@@ -228,7 +228,7 @@ namespace vk_forwarder
             }
 
             // Update chat history text
-            var allText = BuildChatHistoryText(User.Messages, User.UserId, User.FirstName, User.LastName);
+            var allText = BuildChatHistoryText(User.Messages, User.PeerId, User.FirstName, User.LastName);
             User.ChatHistory = allText;
 
             try
@@ -290,16 +290,15 @@ namespace vk_forwarder
 
     public class VkUser
     {
-        public long UserId { get; set; }
+        public long PeerId { get; set; }
         public string FirstName { get; set; }
         public string LastName { get; set; }
-        public int CountOfChange { get; set; }
         public string ChatHistory { get; set; }
         public ObservableCollection<VkNet.Model.Message> Messages { get; set; } = new();
 
         public VkUser(long id, string fName, string lName)
         {
-            UserId = id;
+            PeerId = id;
             FirstName = fName;
             LastName = lName;
         }
@@ -307,7 +306,23 @@ namespace vk_forwarder
         public void AddMessage(VkNet.Model.Message message)
         {
             Messages.Add(message);
-            CountOfChange++;
+        }
+        public void EditMessage(VkNet.Model.Message message)
+        {
+            var foundMessage = Messages.FirstOrDefault(msg => msg.ConversationMessageId == message.ConversationMessageId);
+
+            if (foundMessage != null)
+            {
+                foundMessage.Text = message.Text + "(редакт.)" ?? string.Empty;
+                if (message.Attachments.Count > 0) foundMessage.Attachments = message.Attachments;
+
+                int index = Messages.IndexOf(foundMessage);
+                if (index != -1)
+                {
+                    Messages[index] = foundMessage;
+                }
+            }
+
         }
     }
 }

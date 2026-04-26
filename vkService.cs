@@ -55,11 +55,26 @@ namespace vk_forwarder
                     {
                         if (update.Type.Value == GroupUpdateType.MessageNew)
                         {
-                            var msg = (MessageNew)update.Instance;
-                            var message = msg.Message;
-                            if (message.Text != null && message.FromId != null)
+                            var message = (update.Instance as MessageNew)?.Message;
+                            if (message?.Text != null && message.FromId != null)
                             {
                                 // Просто кладём в очередь — не ждём обработки
+                                _messageQueue.Writer.TryWrite(message);
+                            }
+                        }
+                        else if (update.Type.Value == GroupUpdateType.MessageEdit)
+                        {
+                            var message = update.Instance as Message;
+                            if (message?.Text != null && message.FromId != null)
+                            {
+                                _messageQueue.Writer.TryWrite(message);
+                            }
+                        }
+                        else if (update.Type.Value == GroupUpdateType.MessageReply) 
+                        {
+                            var message = update.Instance as Message;
+                            if (message?.Text != null && message.AdminAuthorId != null)
+                            {
                                 _messageQueue.Writer.TryWrite(message);
                             }
                         }
@@ -127,24 +142,31 @@ namespace vk_forwarder
 
         private static async Task ProcessNewMessage(VkNet.Model.Message message)
         {
-            var userId = (long)message.FromId;
+            var peerId = (long)message.PeerId;
 
-            var existingTab = MessageDispatcher.FirstTabs.FirstOrDefault(tbs => tbs.User.UserId == userId);
+            var existingTab = MessageDispatcher.FirstTabs.FirstOrDefault(tbs => tbs.User.PeerId == peerId);
 
-            if (existingTab == null)
+            if (existingTab == null && message.AdminAuthorId == null)
             {
                 // Получаем имя пользователя только при первом сообщении — не при каждом
-                var user = api.Users.Get(new long[] { userId }).FirstOrDefault();
+                var user = api.Users.Get(new long[] { peerId }).FirstOrDefault();
 
                 FirstTab firstTab = new FirstTab()
                 {
-                    User = new VkUser(userId, user?.FirstName ?? "Неизвестный", user?.LastName ?? "")
+                    User = new VkUser(peerId, user?.FirstName ?? "Неизвестный", user?.LastName ?? "")
                 };
                 firstTab.User.AddMessage(message);
             }
-            else
+            else if (existingTab != null)
             {
-                existingTab.User.AddMessage(message);
+                if (existingTab.User.Messages.Any(msg => msg.ConversationMessageId == message.ConversationMessageId))
+                {
+                    existingTab.User.EditMessage(message);
+                }
+                else 
+                {
+                    existingTab.User.AddMessage(message);
+                }
             }
         }
 
