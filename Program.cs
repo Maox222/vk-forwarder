@@ -63,7 +63,7 @@ namespace vk_forwarder
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine(@"
             ╔═════════════════════════════════════════════════════╗
-            ║          VK Group ↔ Telegram Bridge v1.4            ║
+            ║          VK Group ↔ Telegram Bridge v1.5            ║
             ║   Пересылка сообщений между группой ВК и Telegram   ║
             ╚════════════╗                          ╔═════════════╝
                          ║    [\..Бот запущен../]   ║                   

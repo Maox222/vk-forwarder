@@ -144,11 +144,11 @@ namespace vk_forwarder
                 Console.WriteLine($"[VK] Ошибка при загрузке вложений: {ex.Message}");
             }
 
-            var text = new StringBuilder (message.Text ?? message.Caption ?? string.Empty);
+            var text = new StringBuilder(message.Text ?? message.Caption ?? string.Empty);
             if (vkAttachments.Count > 0) text.Append("\n [Ваши вложения]");
 
             // Add the outgoing message to local history
-            secondTab.User.AddMessage(new VkNet.Model.Message()
+            await secondTab.User.AddMessage(new VkNet.Model.Message()
             {
                 Text = text.ToString(),
                 FromId = message.From?.Id ?? 0,
@@ -162,7 +162,7 @@ namespace vk_forwarder
                     RandomId = new Random().Next(),
                     Message = message.Text ?? message.Caption ?? string.Empty
                 };
-                
+
                 if (vkAttachments.Count > 0)
                     sendParams.Attachments = vkAttachments;
 
@@ -294,10 +294,7 @@ namespace vk_forwarder
 
             try
             {
-                var secondTab = new SecondTab(firstTab.User)
-                {
-                    MessageCountOnOpen = firstTab.User.Messages.Count
-                };
+                var secondTab = new SecondTab(firstTab.User);
 
                 var sentMessage = await botClient.SendMessage(
                     chatId: TelegramService.GetTelegramId(),
@@ -308,6 +305,8 @@ namespace vk_forwarder
 
                 secondTab.TabId = sentMessage.MessageId;
                 SecondTabs.Add(secondTab);
+
+                await vkService.GetVkApi().Messages.MarkAsReadAsync(firstTab.User.PeerId.ToString());
             }
             catch (Exception ex)
             {
@@ -357,7 +356,7 @@ namespace vk_forwarder
                 Console.WriteLine($"Ошибка при возврате к FirstTab: {ex.Message}");
             }
 
-            
+
             await FlushPendingFirstTabs();
         }
 
@@ -827,22 +826,20 @@ namespace vk_forwarder
         //  Auto-delete helper
         // ──────────────────────────────────────────────────────────────────
 
-        private const int AutoDeleteSeconds = 10;
-
         /// <summary>
         /// Tracks <paramref name="messageId"/> in <paramref name="secondTab"/>.BotMessageIds
         /// and schedules its automatic deletion after <see cref="AutoDeleteSeconds"/> seconds.
         /// If the message is already deleted before the timer fires (e.g. via "Закрыть" or "Назад"),
         /// the timer just silently catches the Telegram exception and exits.
         /// </summary>
-        private static void TrackAndAutoDelete(SecondTab secondTab, int messageId)
+        private static void TrackAndAutoDelete(SecondTab secondTab, int messageId, int autoDeleteSeconds = 10)
         {
             if (secondTab != null)
                 secondTab.BotMessageIds.Add(messageId);
 
             _ = Task.Run(async () =>
             {
-                await Task.Delay(TimeSpan.FromSeconds(AutoDeleteSeconds));
+                await Task.Delay(TimeSpan.FromSeconds(autoDeleteSeconds));
                 await AutoDeleteMessage(secondTab, messageId);
             });
         }
@@ -850,7 +847,7 @@ namespace vk_forwarder
         private static async Task AutoDeleteMessage(SecondTab secondTab, int messageId)
         {
             // Guard: if already removed from tracking (deleted manually), nothing to do
-            if (secondTab != null) 
+            if (secondTab != null)
             {
                 if (!secondTab.BotMessageIds.Contains(messageId)) return;
 
@@ -871,12 +868,11 @@ namespace vk_forwarder
         /// <br/>
         /// Supported forms:
         /// <list type="bullet">
-        ///   <item><c>/copy &lt;N&gt;</c> — sends the plain text of message number N back to the admin.</item>
-        ///   <item><c>/copy link</c>      — sends a vk.com profile link for the current interlocutor.</item>
+        ///   <item><c>/copy &lt;N&gt;</c>      — текст сообщения №N.</item>
+        ///   <item><c>/copy &lt;N&gt; r</c>    — текст ответного (ReplyMessage) сообщения №N.</item>
+        ///   <item><c>/copy &lt;N&gt; f&lt;K&gt;</c> — текст K-го пересланного сообщения (сквозная нумерация) внутри сообщения №N.</item>
+        ///   <item><c>/copy link</c>            — ссылка vk.com на собеседника.</item>
         /// </list>
-        /// The command message itself is deleted after processing so it doesn't pollute the chat.
-        /// All result messages auto-delete after <see cref="AutoDeleteSeconds"/> seconds,
-        /// and can also be closed early via the "✖ Закрыть" button.
         /// </summary>
         internal static async Task HandleCopyCommand(
             ITelegramBotClient bot,
@@ -885,23 +881,25 @@ namespace vk_forwarder
             var chatId = TelegramService.GetTelegramId();
             var secondTab = SecondTabs.FirstOrDefault();
 
-            // Always delete the /copy command message first
             try { await bot.DeleteMessage(chatId, message.MessageId); } catch { }
 
             if (secondTab == null)
             {
                 var warn = await bot.SendMessage(chatId, "⚠️ Команда /copy доступна только в открытом диалоге.");
-                TrackAndAutoDelete(secondTab, warn.MessageId);
+                await Task.Delay(3000);
+                try { await bot.DeleteMessage(chatId, warn.MessageId); } catch { }
                 return;
             }
 
-            // Parse argument — everything after "/copy "
-            var text = message.Text ?? string.Empty;
+            var text = (message.Text ?? string.Empty).Trim();
+            // arg = everything after "/copy "
             var arg = text.Length > 5 ? text.Substring(5).Trim() : string.Empty;
 
             if (string.IsNullOrEmpty(arg))
             {
-                var warn = await bot.SendMessage(chatId, "⚠️ Укажи номер сообщения или 'link'.\nПример: /copy 3  или  /copy link");
+                var warn = await bot.SendMessage(chatId,
+                    "⚠️ Укажи аргумент.\n" +
+                    "Примеры:\n/copy 3\n/copy 3 r\n/copy 3 f2\n/copy link");
                 TrackAndAutoDelete(secondTab, warn.MessageId);
                 return;
             }
@@ -913,19 +911,21 @@ namespace vk_forwarder
                 var sent = await bot.SendMessage(
                     chatId,
                     text: link,
-                    replyMarkup: MakeCloseKeyboard(0), // placeholder, updated below
+                    replyMarkup: MakeCloseKeyboard(0),
                     linkPreviewOptions: new LinkPreviewOptions { IsDisabled = true }
                 );
-                // Update keyboard with the real message id so the callback can delete it early
                 await bot.EditMessageReplyMarkup(chatId, sent.MessageId, MakeCloseKeyboard(sent.MessageId));
                 secondTab.BotMessageIds.Add(sent.MessageId);
                 return;
             }
 
-            // ── /copy <N> ─────────────────────────────────────────────────
-            if (!int.TryParse(arg, out int index) || index < 1)
+            // ── Parse "<N>" or "<N> r" or "<N> f<K>" ─────────────────────
+            // Split on whitespace into at most 2 parts
+            var parts = arg.Split(new[] { ' ', '\t' }, 2, StringSplitOptions.RemoveEmptyEntries);
+
+            if (!int.TryParse(parts[0], out int index) || index < 1)
             {
-                var warn = await bot.SendMessage(chatId, "⚠️ Неверный аргумент. Укажи номер сообщения (число) или 'link'.");
+                var warn = await bot.SendMessage(chatId, "⚠️ Неверный аргумент. Укажи номер сообщения (число), 'link', или например: /copy 3 f2");
                 TrackAndAutoDelete(secondTab, warn.MessageId);
                 return;
             }
@@ -939,18 +939,167 @@ namespace vk_forwarder
             }
 
             var target = messages[index - 1];
-            var msgText = target.Text ?? string.Empty;
+            string suffix = parts.Length > 1 ? parts[1].Trim() : string.Empty;
 
-            if (string.IsNullOrWhiteSpace(msgText))
+            string? resultText = null;
+
+            if (string.IsNullOrEmpty(suffix))
             {
-                var warn = await bot.SendMessage(chatId, $"⚠️ Сообщение №{index} не содержит текста.");
-                TrackAndAutoDelete(secondTab, warn.MessageId);
+                // ── /copy N — основной текст ──────────────────────────────
+                resultText = string.IsNullOrWhiteSpace(target.Text) ? null : target.Text;
+                if (resultText == null)
+                {
+                    var warn = await bot.SendMessage(chatId, $"⚠️ Сообщение №{index} не содержит текста.");
+                    TrackAndAutoDelete(secondTab, warn.MessageId);
+                    return;
+                }
+            }
+            else if (suffix.StartsWith("r", StringComparison.OrdinalIgnoreCase)
+                     && int.TryParse(suffix.Substring(1), out int replyIndex)
+                     && replyIndex >= 1)
+            {
+                // ── /copy N r<K> — текст K-го ответного сообщения ─────────
+                var replyMsg = FindReplyByCrossIndex(messages, index, replyIndex);
+                if (replyMsg == null)
+                {
+                    var warn = await bot.SendMessage(chatId, $"⚠️ Ответное сообщение r{replyIndex} в сообщении №{index} не найдено.");
+                    TrackAndAutoDelete(secondTab, warn.MessageId);
+                    return;
+                }
+                resultText = string.IsNullOrWhiteSpace(replyMsg.Text) ? null : replyMsg.Text;
+                if (resultText == null)
+                {
+                    var warn = await bot.SendMessage(chatId, $"⚠️ Ответное сообщение r{replyIndex} не содержит текста.");
+                    TrackAndAutoDelete(secondTab, warn.MessageId);
+                    return;
+                }
+            }
+            else if (suffix.StartsWith("f", StringComparison.OrdinalIgnoreCase)
+                     && int.TryParse(suffix.Substring(1), out int fwdIndex)
+                     && fwdIndex >= 1)
+            {
+                // ── /copy N f<K> — текст K-го пересланного (сквозная нумерация) ──
+                // Rebuild the same counter as BuildChatHistoryText to find the right message
+                var fwdMsg = FindForwardedByCrossIndex(messages, index, fwdIndex);
+                if (fwdMsg == null)
+                {
+                    var warn = await bot.SendMessage(chatId, $"⚠️ Пересланное сообщение f{fwdIndex} не найдено.");
+                    TrackAndAutoDelete(secondTab, warn.MessageId);
+                    return;
+                }
+                resultText = string.IsNullOrWhiteSpace(fwdMsg.Text) ? null : fwdMsg.Text;
+                if (resultText == null)
+                {
+                    var warn = await bot.SendMessage(chatId, $"⚠️ Пересланное сообщение f{fwdIndex} не содержит текста.");
+                    TrackAndAutoDelete(secondTab, warn.MessageId);
+                    return;
+                }
+            }
+            else
+            {
+                var warn = await bot.SendMessage(chatId,
+                    "⚠️ Неверный суффикс. Используй:\n/copy 3 — скопировать текст 3 сообщения\n" +
+                    "/copy 3 r1 — скопировать текст 1 ответа 3 сообщения\n/copy 3 f2 — скопировать текст 2 пересланного сообщения 3 сообщения");
+                await bot.EditMessageReplyMarkup(chatId, warn.MessageId, MakeCloseKeyboard(warn.MessageId));
+                secondTab.BotMessageIds.Add(warn.MessageId);
                 return;
             }
 
-            var result = await bot.SendMessage(chatId, msgText, replyMarkup: MakeCloseKeyboard(0));
+            var result = await bot.SendMessage(chatId, resultText, replyMarkup: MakeCloseKeyboard(0));
             await bot.EditMessageReplyMarkup(chatId, result.MessageId, MakeCloseKeyboard(result.MessageId));
             secondTab.BotMessageIds.Add(result.MessageId);
+        }
+
+        /// <summary>
+        /// Finds forwarded message by its local f-index within top-level message at <paramref name="msgIndex"/>.
+        /// </summary>
+        private static VkNet.Model.Message? FindForwardedByCrossIndex(
+            System.Collections.ObjectModel.ObservableCollection<VkNet.Model.Message> messages,
+            int msgIndex,
+            int targetFwdIndex)
+        {
+            var msg = messages[msgIndex - 1];
+            int fwdCounter = 1;
+            int replyCounter = 1;
+            return WalkMessage(msg, targetFwdIndex, ref fwdCounter, ref replyCounter, searchReplies: false);
+        }
+
+        /// <summary>
+        /// Finds reply message by its local r-index within top-level message at <paramref name="msgIndex"/>.
+        /// </summary>
+        private static VkNet.Model.Message? FindReplyByCrossIndex(
+            System.Collections.ObjectModel.ObservableCollection<VkNet.Model.Message> messages,
+            int msgIndex,
+            int targetReplyIndex)
+        {
+            var msg = messages[msgIndex - 1];
+            int fwdCounter = 1;
+            int replyCounter = 1;
+            return WalkMessage(msg, targetReplyIndex, ref fwdCounter, ref replyCounter, searchReplies: true);
+        }
+
+        /// <summary>
+        /// Walks a single message node (mirrors AppendMessageWithNested order exactly),
+        /// keeping fwdCounter and replyCounter in sync.
+        /// Returns the matching forwarded or reply message depending on <paramref name="searchReplies"/>.
+        /// </summary>
+        private static VkNet.Model.Message? WalkMessage(
+            VkNet.Model.Message msg,
+            int targetIndex,
+            ref int fwdCounter,
+            ref int replyCounter,
+            bool searchReplies)
+        {
+            // 1. ReplyMessage (mirrors: if msg.ReplyMessage != null block)
+            if (msg.ReplyMessage != null)
+            {
+                int currentReply = replyCounter;
+                replyCounter++;
+
+                if (searchReplies && currentReply == targetIndex)
+                    return msg.ReplyMessage;
+
+                // Recurse into reply's forwarded
+                if (msg.ReplyMessage.ForwardedMessages != null)
+                {
+                    var found = WalkForwardedList(msg.ReplyMessage.ForwardedMessages, targetIndex, ref fwdCounter, ref replyCounter, searchReplies);
+                    if (found != null) return found;
+                }
+            }
+
+            // 2. ForwardedMessages (mirrors: if msg.ForwardedMessages != null block)
+            if (msg.ForwardedMessages != null)
+            {
+                var found = WalkForwardedList(msg.ForwardedMessages, targetIndex, ref fwdCounter, ref replyCounter, searchReplies);
+                if (found != null) return found;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Iterates a list of forwarded messages, mirrors AppendForwardedMessages order exactly.
+        /// </summary>
+        private static VkNet.Model.Message? WalkForwardedList(
+            IEnumerable<VkNet.Model.Message> forwardedMessages,
+            int targetIndex,
+            ref int fwdCounter,
+            ref int replyCounter,
+            bool searchReplies)
+        {
+            foreach (var fwd in forwardedMessages)
+            {
+                int currentFwd = fwdCounter;
+                fwdCounter++;
+
+                if (!searchReplies && currentFwd == targetIndex)
+                    return fwd;
+
+                // Recurse into this forwarded message's own reply/forwarded tree
+                var found = WalkMessage(fwd, targetIndex, ref fwdCounter, ref replyCounter, searchReplies);
+                if (found != null) return found;
+            }
+            return null;
         }
 
         // ──────────────────────────────────────────────────────────────────

@@ -155,17 +155,17 @@ namespace vk_forwarder
                 {
                     User = new VkUser(peerId, user?.FirstName ?? "Неизвестный", user?.LastName ?? "")
                 };
-                firstTab.User.AddMessage(message);
+                await firstTab.User.AddMessage(message);
             }
             else if (existingTab != null)
             {
                 if (existingTab.User.Messages.Any(msg => msg.ConversationMessageId == message.ConversationMessageId))
                 {
-                    existingTab.User.EditMessage(message);
+                    await existingTab.User.EditMessage(message);
                 }
                 else 
                 {
-                    existingTab.User.AddMessage(message);
+                    await existingTab.User.AddMessage(message);
                 }
             }
         }

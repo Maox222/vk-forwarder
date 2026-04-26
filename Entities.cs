@@ -68,6 +68,7 @@ namespace vk_forwarder
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Не удалось обновить сообщение в 1 блоке: {ex.Message}");
+
                 }
             }
             else if (TabId == 0 && User.Messages[e.NewStartingIndex].AdminAuthorId == null)
@@ -84,15 +85,37 @@ namespace vk_forwarder
                 Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
                 await MessageDispatcher.AddNewMessageToTelegram(this);
             }
+            else if (TabId != 0 && User.Messages[e.NewStartingIndex].AdminAuthorId != null)
+            {
+                // If messages sent by admin outside of Telegram
+                try
+                {
+                    var bot = TelegramService.GetTelegramBot();
+                    var chatId = TelegramService.GetTelegramId();
+
+                    string newDescription = $"✔️{User.FirstName} {User.LastName}: Прочитано";
+                    if (Description != newDescription) 
+                    {
+                        Description = newDescription;
+                        await bot.EditMessageText(TelegramService.GetTelegramId(), TabId, Description, replyMarkup: GetInlineKeyboard());
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Ошибка при редактировании FirstTab на Прочитано: {ex.Message}");
+                }
+            }
 
         }
 
         /// <summary>
         /// Builds numbered chat history with "вы" / "ваш собеседник" labels and [вложения] markers.
+        /// Forwarded messages are numbered locally within each top-level message (f1, f2, f3…).
         /// </summary>
         internal static string BuildChatHistoryText(ObservableCollection<VkNet.Model.Message> messages, long ownerId, string firstName, string lastName)
         {
             var sb = new StringBuilder();
+
             for (int i = 0; i < messages.Count; i++)
             {
                 var m = messages[i];
@@ -100,7 +123,11 @@ namespace vk_forwarder
                 string label = isOwn ? "\tВы\t" : $"\t{firstName} {lastName}\t";
 
                 sb.AppendLine($"[{label}]");
-                AppendMessageWithNested(sb, m, i + 1, indentLevel: 0);
+
+                // Локальные счётчики — сбрасываются для каждого сообщения
+                int localFwd = 1;
+                int localReply = 1;
+                AppendMessageWithNested(sb, m, i + 1, indentLevel: 0, ref localFwd, ref localReply);
 
                 if (i < messages.Count - 1)
                     sb.AppendLine();
@@ -108,51 +135,45 @@ namespace vk_forwarder
             return sb.ToString().TrimEnd();
         }
 
-        // Рекурсивная функция для форматирования сообщения и всех его вложенных пересылок/ответов
-        private static void AppendMessageWithNested(StringBuilder sb, VkNet.Model.Message msg, int number, int indentLevel)
+        private static void AppendMessageWithNested(StringBuilder sb, VkNet.Model.Message msg, int number, int indentLevel, ref int fwdCounter, ref int replyCounter)
         {
             string indent = new string('\t', indentLevel);
 
-            // Основной текст сообщения
             string text = string.IsNullOrWhiteSpace(msg.Text) ? string.Empty : msg.Text;
             bool hasAttachments = msg.Attachments != null && msg.Attachments.Count > 0;
             string attachmentMark = hasAttachments ? " [Вложения]" : string.Empty;
 
             sb.AppendLine($"{indent}{number}. {text}{attachmentMark}");
 
-            // Обработка ответного сообщения (ReplyMessage)
             if (msg.ReplyMessage != null)
             {
+                int currentReply = replyCounter;
+                replyCounter++;
+
                 var reply = msg.ReplyMessage;
                 string replyText = string.IsNullOrWhiteSpace(reply.Text) ? string.Empty : reply.Text;
                 bool replyHasAttachments = reply.Attachments != null && reply.Attachments.Count > 0;
                 string replyAttachmentMark = replyHasAttachments ? " [Вложения]" : string.Empty;
                 sb.AppendLine($"{indent}\t➡️ Ответ на: {replyText}{replyAttachmentMark}");
 
-                // Если в ответном сообщении есть свои пересланные — обработаем их рекурсивно
                 if (reply.ForwardedMessages != null && reply.ForwardedMessages.Count > 0)
-                {
-                    AppendForwardedMessages(sb, reply.ForwardedMessages, indentLevel + 1);
-                }
+                    AppendForwardedMessages(sb, reply.ForwardedMessages, indentLevel + 1, ref fwdCounter, ref replyCounter);
             }
 
-            // Обработка пересланных сообщений
             if (msg.ForwardedMessages != null && msg.ForwardedMessages.Count > 0)
-            {
-                AppendForwardedMessages(sb, msg.ForwardedMessages, indentLevel);
-            }
+                AppendForwardedMessages(sb, msg.ForwardedMessages, indentLevel, ref fwdCounter, ref replyCounter);
         }
 
-        // Вспомогательный метод для обработки списка пересланных сообщений
-        private static void AppendForwardedMessages(StringBuilder sb, IEnumerable<VkNet.Model.Message> forwardedMessages, int indentLevel)
+        private static void AppendForwardedMessages(StringBuilder sb, IEnumerable<VkNet.Model.Message> forwardedMessages, int indentLevel, ref int fwdCounter, ref int replyCounter)
         {
             string indent = new string('\t', indentLevel);
-            int fwdCounter = 1;
             foreach (var fwdMsg in forwardedMessages)
             {
-                sb.AppendLine($"{indent}\t↩️ Пересланное");
-                AppendMessageWithNested(sb, fwdMsg, fwdCounter, indentLevel + 1);
+                int currentIndex = fwdCounter;
                 fwdCounter++;
+
+                sb.AppendLine($"{indent}\t↩️ Пересланное");
+                AppendMessageWithNested(sb, fwdMsg, currentIndex, indentLevel + 1, ref fwdCounter, ref replyCounter);
             }
         }
 
@@ -181,12 +202,6 @@ namespace vk_forwarder
         /// </summary>
         public bool IsAwaitingAttachmentIndex { get; set; } = false;
 
-        /// <summary>
-        /// Number of messages when this SecondTab was opened.
-        /// Used to detect new messages that arrived while the dialog was open.
-        /// </summary>
-        public int MessageCountOnOpen { get; set; }
-
         private bool _disposed = false;
 
         public SecondTab(VkUser user)
@@ -198,7 +213,7 @@ namespace vk_forwarder
         {
 
             var hasAttachments = User.Messages.Any(m => m.Attachments != null && m.Attachments.Count > 0 
-            || m.ForwardedMessages != null && m.ForwardedMessages.Count > 0 || m.ReplyMessage != null);
+            || m.ForwardedMessages != null && m.ForwardedMessages.Count > 0 || m.ReplyMessage?.Attachments != null && m.ReplyMessage.Attachments.Count > 0);
 
             if (hasAttachments)
             {
@@ -247,7 +262,7 @@ namespace vk_forwarder
                 // Сообщения отображены в открытом диалоге — считаем прочитанными.
                 // HandleBack проверяет MessageCountOnOpen, чтобы решить "новые или нет":
                 // раз мы уже показали все сообщения, обновляем счётчик.
-                MessageCountOnOpen = User.Messages.Count;
+                //MessageCountOnOpen = User.Messages.Count;
             }
             catch (Exception ex)
             {
@@ -303,11 +318,17 @@ namespace vk_forwarder
             LastName = lName;
         }
 
-        public void AddMessage(VkNet.Model.Message message)
+        public async Task AddMessage(VkNet.Model.Message message)
         {
             Messages.Add(message);
+
+            // If dialog is open Mark As Read Instantly
+            if (MessageDispatcher.SecondTabs.Count > 0 && MessageDispatcher.SecondTabs.Any(tbs => tbs.User.PeerId == PeerId)) 
+            {
+                await vkService.GetVkApi().Messages.MarkAsReadAsync(PeerId.ToString());
+            }
         }
-        public void EditMessage(VkNet.Model.Message message)
+        public async Task EditMessage(VkNet.Model.Message message)
         {
             var foundMessage = Messages.FirstOrDefault(msg => msg.ConversationMessageId == message.ConversationMessageId);
 
@@ -320,6 +341,12 @@ namespace vk_forwarder
                 if (index != -1)
                 {
                     Messages[index] = foundMessage;
+
+                    // If dialog is open Mark As Read Instantly
+                    if (MessageDispatcher.SecondTabs.Count > 0 && MessageDispatcher.SecondTabs.Any(tbs => tbs.User.PeerId == PeerId))
+                    {
+                        await vkService.GetVkApi().Messages.MarkAsReadAsync(PeerId.ToString());
+                    }
                 }
             }
 
