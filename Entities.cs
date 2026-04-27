@@ -28,7 +28,8 @@ namespace vk_forwarder
 
         public string Description { get; set; }
 
-
+        public bool ConfirmationForDelete { get; set; } = false;
+        public int ConfirmationMessageId { get; set; } = 0;
         public virtual InlineKeyboardMarkup GetInlineKeyboard()
         {
             return new InlineKeyboardMarkup(new[]
@@ -43,8 +44,8 @@ namespace vk_forwarder
         internal async virtual void Messages_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
         {
             if (_disposed) return;
-            var allText = BuildChatHistoryText(User.Messages, User.PeerId, User.FirstName, User.LastName);
-            User.ChatHistory = allText;
+            if (User.IsTrimming) return;
+            User.ChatHistory = BuildChatHistoryText(User.Messages, User.PeerId, User.FirstName, User.LastName);
 
             if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0 && User.Messages[e.NewStartingIndex].AdminAuthorId == null)
             {
@@ -132,7 +133,10 @@ namespace vk_forwarder
                 if (i < messages.Count - 1)
                     sb.AppendLine();
             }
-            return sb.ToString().TrimEnd();
+            var result = sb.ToString().TrimEnd();
+
+
+            return result;
         }
 
         private static void AppendMessageWithNested(StringBuilder sb, VkNet.Model.Message msg, int number, int indentLevel, ref int fwdCounter, ref int replyCounter)
@@ -235,6 +239,7 @@ namespace vk_forwarder
         internal async override void Messages_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
         {
             if (_disposed) return;
+            if (User.IsTrimming) return;
 
             if (User?.Messages.Count < 1)
             {
@@ -243,8 +248,7 @@ namespace vk_forwarder
             }
 
             // Update chat history text
-            var allText = BuildChatHistoryText(User.Messages, User.PeerId, User.FirstName, User.LastName);
-            User.ChatHistory = allText;
+            User.ChatHistory = BuildChatHistoryText(User.Messages, User.PeerId, User.FirstName, User.LastName);
 
             try
             {
@@ -259,10 +263,6 @@ namespace vk_forwarder
                     linkPreviewOptions: new LinkPreviewOptions { IsDisabled = true }
                 );
 
-                // Сообщения отображены в открытом диалоге — считаем прочитанными.
-                // HandleBack проверяет MessageCountOnOpen, чтобы решить "новые или нет":
-                // раз мы уже показали все сообщения, обновляем счётчик.
-                //MessageCountOnOpen = User.Messages.Count;
             }
             catch (Exception ex)
             {
@@ -318,8 +318,44 @@ namespace vk_forwarder
             LastName = lName;
         }
 
+        private const int MaxChatHistoryLength = 4000;
+
+        /// <summary>
+        /// True while AddMessage is silently removing old messages to fit the history limit.
+        /// Both Messages_CollectionChanged handlers check this flag and skip processing during trim.
+        /// </summary>
+        internal bool IsTrimming { get; private set; } = false;
+
         public async Task AddMessage(VkNet.Model.Message message)
         {
+            // If message Text is too big - crop it to 3997 length + 3 dots
+            if (message.Text.Length > MaxChatHistoryLength) 
+            {
+                message.Text = message.Text.Substring(0, MaxChatHistoryLength - 3) + "..."; 
+            }
+            // Calculate how many old messages need to be removed before adding the new one,
+            // using a plain List so no CollectionChanged fires during the preview loop.
+            var preview = Messages.ToList();
+            preview.Add(message);
+
+            while (preview.Count > 1 &&
+                   FirstTab.BuildChatHistoryText(
+                       new ObservableCollection<VkNet.Model.Message>(preview),
+                       PeerId, FirstName, LastName).Length > MaxChatHistoryLength)
+            {
+                preview.RemoveAt(0);
+            }
+
+            int toRemove = Messages.Count - (preview.Count - 1);
+
+            if (toRemove > 0)
+            {
+                IsTrimming = true;
+                for (int i = 0; i < toRemove; i++)
+                    Messages.RemoveAt(0);
+                IsTrimming = false;
+            }
+
             Messages.Add(message);
 
             // If dialog is open Mark As Read Instantly

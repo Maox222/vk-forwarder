@@ -158,12 +158,34 @@ namespace vk_forwarder.Telegram
             var firstTab = MessageDispatcher.FirstTabs.FirstOrDefault(t => t.TabId == messageId);
             if (firstTab == null) return;
 
+            if (firstTab.ConfirmationForDelete == false)
+            {
+                var warn = await _botClient.SendMessage(chatId: TelegramChatId, "⚠️ Вы уверены? (нажмите еще раз удалить)");
+                firstTab.ConfirmationForDelete = true;
+                firstTab.ConfirmationMessageId = warn.MessageId; 
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(3));
+                    if (firstTab != null && firstTab.ConfirmationForDelete)
+                    {
+                        firstTab.ConfirmationForDelete = false;
+                        firstTab.ConfirmationMessageId = 0;
+                        await _botClient.DeleteMessage(TelegramChatId, warn.MessageId);
+                    }
+                });
+                return;
+            }
+
+            // Второе нажатие — подтверждение получено
+            int warnId = firstTab.ConfirmationMessageId;
             MessageDispatcher.FirstTabs.Remove(firstTab);
             firstTab.Dispose();
 
             try
             {
                 await _botClient.DeleteMessage(TelegramChatId, messageId);
+                if (warnId != 0)
+                    await _botClient.DeleteMessage(TelegramChatId, warnId);
             }
             catch (Exception ex)
             {
