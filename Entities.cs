@@ -45,9 +45,12 @@ namespace vk_forwarder
         {
             if (_disposed) return;
             if (User.IsTrimming) return;
+            if (e.NewStartingIndex < 0) return;
+
+            long? AdminId = User.Messages[e.NewStartingIndex].AdminAuthorId;
             User.ChatHistory = BuildChatHistoryText(User.Messages, User.PeerId, User.FirstName, User.LastName);
 
-            if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0 && User.Messages[e.NewStartingIndex].AdminAuthorId == null)
+            if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0 && AdminId == null)
             {
                 // SecondTab closed, tab already sent — delete old and resend to trigger a push notification
                 try
@@ -72,21 +75,21 @@ namespace vk_forwarder
 
                 }
             }
-            else if (TabId == 0 && User.Messages[e.NewStartingIndex].AdminAuthorId == null)
+            else if (TabId == 0 && AdminId == null)
             {
                 // Tab not yet sent — pass to dispatcher which will queue it if SecondTab is open
                 Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
                 await MessageDispatcher.AddNewMessageToTelegram(this);
             }
-            else if (MessageDispatcher.SecondTabs.Count > 0 && TabId != 0 && User.PeerId != MessageDispatcher.SecondTabs.FirstOrDefault().User?.PeerId
-                && User.Messages[e.NewStartingIndex].AdminAuthorId == null)
+            else if (MessageDispatcher.SecondTabs.Count > 0 && TabId != 0 && 
+                User.PeerId != MessageDispatcher.SecondTabs.FirstOrDefault()?.User?.PeerId && AdminId == null)
             {
                 // SecondTab is open (with a different user) and this FirstTab already exists —
                 // mark as pending so FlushPendingFirstTabs will delete+resend it on back press
                 Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
                 await MessageDispatcher.AddNewMessageToTelegram(this);
             }
-            else if (TabId != 0 && User.Messages[e.NewStartingIndex].AdminAuthorId != null)
+            else if (TabId != 0 && AdminId != null)
             {
                 // If messages sent by admin outside of Telegram
                 try
