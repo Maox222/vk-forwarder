@@ -1,11 +1,9 @@
 # vk-forwarder
 Бот для пересылки сообщений из группы ВКонтакте в Telegram с возможностью отвечать прямо из Telegram.
 
-<p align="left">
-  <img src="images/Screenshot_10.png" width="70%">,
-</p>
-<p align="left">
-  <img src="images/Screenshot_1.png" width="70%">,
+<p align="center">
+  <img src="images/Screenshot_10.png" width="45%">
+  <img src="images/Screenshot_1.png" width="45%">
 </p>
 
 ## Возможности
