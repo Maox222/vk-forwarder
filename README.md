@@ -108,7 +108,7 @@ Wants=network-online.target
 [Service]
 WorkingDirectory=/ваш_путь/папка_для_бота/publish/
 ExecStart=/usr/bin/dotnet /ваш_путь/папка_для_бота/publish/vk-forwarder.dll
-Restart=on-failure
+Restart=always
 RestartSec=10
 KillSignal=SIGINT
 User=ваше_имя
