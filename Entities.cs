@@ -13,6 +13,7 @@ namespace vk_forwarder
     {
         public int TabId { get; set; }
         private bool _disposed = false;
+        protected bool IsDisposed => _disposed;
 
         private VkUser _user;
 
@@ -21,8 +22,13 @@ namespace vk_forwarder
             get { return _user; }
             set
             {
+                if (_user != null)
+                    _user.Messages.CollectionChanged -= Messages_CollectionChanged;
+
                 _user = value;
-                _user.Messages.CollectionChanged += Messages_CollectionChanged;
+
+                if (_user != null)
+                    _user.Messages.CollectionChanged += Messages_CollectionChanged;
             }
         }
 
@@ -43,14 +49,18 @@ namespace vk_forwarder
 
         internal async virtual void Messages_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
         {
-            if (_disposed) return;
+            if (IsDisposed) return;
             if (User.IsTrimming) return;
-            if (e.NewStartingIndex < 0) return;
-
-            long? AdminId = User.Messages[e.NewStartingIndex].AdminAuthorId;
+            if (e.Action == NotifyCollectionChangedAction.Remove || e.NewItems == null) 
+            {
+                Console.WriteLine("Возвращение из события, action.Remove или newItems = null");
+                return;
+            }
+            
+            VkNet.Model.Message lastMessage = e.NewItems[0] as VkNet.Model.Message;
             User.ChatHistory = BuildChatHistoryText(User.Messages, User.PeerId, User.FirstName, User.LastName);
 
-            if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0 && AdminId == null)
+            if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0 && lastMessage.Type.Value == VkNet.Enums.MessageType.Received)
             {
                 // SecondTab closed, tab already sent — delete old and resend to trigger a push notification
                 try
@@ -75,21 +85,21 @@ namespace vk_forwarder
 
                 }
             }
-            else if (TabId == 0 && AdminId == null)
+            else if (TabId == 0 && lastMessage.Type.Value == VkNet.Enums.MessageType.Received)
             {
                 // Tab not yet sent — pass to dispatcher which will queue it if SecondTab is open
                 Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
                 await MessageDispatcher.AddNewMessageToTelegram(this);
             }
             else if (MessageDispatcher.SecondTabs.Count > 0 && TabId != 0 && 
-                User.PeerId != MessageDispatcher.SecondTabs.FirstOrDefault()?.User?.PeerId && AdminId == null)
+                User.PeerId != MessageDispatcher.SecondTabs.FirstOrDefault()?.User?.PeerId && lastMessage.Type.Value == VkNet.Enums.MessageType.Received)
             {
                 // SecondTab is open (with a different user) and this FirstTab already exists —
                 // mark as pending so FlushPendingFirstTabs will delete+resend it on back press
                 Description = $"📨{User?.FirstName} {User?.LastName}: У вас новое сообщение".Trim();
                 await MessageDispatcher.AddNewMessageToTelegram(this);
             }
-            else if (TabId != 0 && AdminId != null)
+            else if (MessageDispatcher.SecondTabs.Count < 1 && TabId != 0 && lastMessage.Type.Value == VkNet.Enums.MessageType.Sended)
             {
                 // If messages sent by admin outside of Telegram
                 try
@@ -114,7 +124,6 @@ namespace vk_forwarder
 
         /// <summary>
         /// Builds numbered chat history with "вы" / "ваш собеседник" labels and [вложения] markers.
-        /// Forwarded messages are numbered locally within each top-level message (f1, f2, f3…).
         /// </summary>
         internal static string BuildChatHistoryText(ObservableCollection<VkNet.Model.Message> messages, long ownerId, string firstName, string lastName)
         {
@@ -186,15 +195,26 @@ namespace vk_forwarder
 
         public void Dispose()
         {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
             if (_disposed) return;
 
-            User.Messages.CollectionChanged -= Messages_CollectionChanged;
+            if (disposing)
+            {
+                // Очистка управляемых ресурсов FirstTab
+                if (_user != null)
+                    _user.Messages.CollectionChanged -= Messages_CollectionChanged;
+            }
 
             _disposed = true;
         }
     }
 
-    public class SecondTab : FirstTab, IDisposable
+    public class SecondTab : FirstTab
     {
         public int AdditionalMessageId { get; set; }
 
@@ -209,7 +229,6 @@ namespace vk_forwarder
         /// </summary>
         public bool IsAwaitingAttachmentIndex { get; set; } = false;
 
-        private bool _disposed = false;
 
         public SecondTab(VkUser user)
         {
@@ -241,7 +260,7 @@ namespace vk_forwarder
 
         internal async override void Messages_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
         {
-            if (_disposed) return;
+            if (IsDisposed) return;
             if (User.IsTrimming) return;
 
             if (User?.Messages.Count < 1)
@@ -256,7 +275,7 @@ namespace vk_forwarder
             try
             {
                 var bot = TelegramService.GetTelegramBot();
-                if (bot == null || _disposed) return;
+                if (bot == null || IsDisposed) return;
 
                 await bot.EditMessageText(
                     chatId: TelegramService.GetTelegramId(),
@@ -269,7 +288,7 @@ namespace vk_forwarder
             }
             catch (Exception ex)
             {
-                if (!_disposed)
+                if (!IsDisposed)
                     Console.WriteLine($"Не удалось обновить сообщение: {ex.Message}");
             }
         }
@@ -296,13 +315,18 @@ namespace vk_forwarder
             BotMessageIds.Clear();
         }
 
-        public void Dispose() 
+        protected override void Dispose(bool disposing)
         {
-            if (_disposed) return;
+            if (IsDisposed) return;
 
-            User.Messages.CollectionChanged -= Messages_CollectionChanged;
+            if (disposing)
+            {
+                // Очистка ресурсов специфичных для SecondTab
+                BotMessageIds.Clear();
+            }
 
-            _disposed = true;
+            // Вызов родителя — он отпишется от CollectionChanged и выставит _disposed
+            base.Dispose(disposing);
         }
     }
 
@@ -313,6 +337,8 @@ namespace vk_forwarder
         public string LastName { get; set; }
         public string ChatHistory { get; set; }
         public ObservableCollection<VkNet.Model.Message> Messages { get; set; } = new();
+        public CancellationTokenSource? InactivityTimer { get; set; }
+        public bool WaitingAfterButton { get; set; } = false;
 
         public VkUser(long id, string fName, string lName)
         {
@@ -354,9 +380,18 @@ namespace vk_forwarder
             if (toRemove > 0)
             {
                 IsTrimming = true;
-                for (int i = 0; i < toRemove; i++)
-                    Messages.RemoveAt(0);
-                IsTrimming = false;
+                try
+                {
+                    int actualToRemove = Math.Min(toRemove, Messages.Count);
+                    for (int i = 0; i < actualToRemove; i++)
+                    {
+                        Messages.RemoveAt(0);
+                    }
+                }
+                finally
+                {
+                    IsTrimming = false;
+                }
             }
 
             Messages.Add(message);
@@ -369,12 +404,13 @@ namespace vk_forwarder
         }
         public async Task EditMessage(VkNet.Model.Message message)
         {
-            var foundMessage = Messages.FirstOrDefault(msg => msg.ConversationMessageId == message.ConversationMessageId);
+            var foundMessage = Messages.FirstOrDefault(msg => msg.Id == message.Id);
 
             if (foundMessage != null)
             {
                 foundMessage.Text = message.Text + " (ред.)" ?? string.Empty;
-                if (message.Attachments.Count > 0) foundMessage.Attachments = message.Attachments;
+
+                if (message.Attachments?.Count > 0) foundMessage.Attachments = message.Attachments;
 
                 int index = Messages.IndexOf(foundMessage);
                 if (index != -1)
@@ -388,7 +424,7 @@ namespace vk_forwarder
                     }
                 }
             }
-
         }
+        public void RemoveMessage(VkNet.Model.Message message) => Messages.Remove(message);
     }
 }

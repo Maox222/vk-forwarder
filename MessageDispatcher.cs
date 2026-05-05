@@ -1,17 +1,9 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
 using System.Text;
-using System.Threading.Tasks;
 using Telegram.Bot;
 using Telegram.Bot.Types;
-using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 using vk_forwarder.Telegram;
-using VkNet.Enums.StringEnums;
-using VkNet.Model;
+using VkNet.Exception;
 
 namespace vk_forwarder
 {
@@ -25,6 +17,11 @@ namespace vk_forwarder
         /// Queue of FirstTabs waiting to be sent while a SecondTab is open.
         /// </summary>
         private static Queue<FirstTab> _pendingFirstTabs = new Queue<FirstTab>();
+
+        // Буфер для альбомов из Telegram: MediaGroupId → (накопленные сообщения, таймер)
+        private static readonly Dictionary<string, (List<global::Telegram.Bot.Types.Message> Messages, CancellationTokenSource Timer)>
+            _mediaGroupBuffer = new();
+        private static readonly object _mediaGroupLock = new();
 
         // ──────────────────────────────────────────────────────────────────
         //  Adding new dialogs / messages
@@ -120,21 +117,146 @@ namespace vk_forwarder
         }
 
         internal static async void AddNewMessageToVk(
-            ITelegramBotClient botClient,
-            global::Telegram.Bot.Types.Message message,
-            CancellationToken cancellationToken)
+    ITelegramBotClient botClient,
+    global::Telegram.Bot.Types.Message message,
+    CancellationToken cancellationToken)
         {
             if (SecondTabs == null || SecondTabs.Count == 0) return;
 
             SecondTab secondTab = SecondTabs.First();
-
-
-            // Track this user message so it can be deleted afterwards
             secondTab.BotMessageIds.Add(message.MessageId);
 
-            // ── Forward attachments from Telegram → VK ──────────────────
+            // Если сообщение входит в альбом — буферизуем
+            if (!string.IsNullOrEmpty(message.MediaGroupId))
+            {
+                bool shouldFlush = false;
+                CancellationTokenSource? oldTimer = null;
+                CancellationTokenSource newTimer = new CancellationTokenSource();
+
+                lock (_mediaGroupLock)
+                {
+                    if (_mediaGroupBuffer.TryGetValue(message.MediaGroupId, out var existing))
+                    {
+                        oldTimer = existing.Timer;
+                        existing.Messages.Add(message);
+                        _mediaGroupBuffer[message.MediaGroupId] = (existing.Messages, newTimer);
+                    }
+                    else
+                    {
+                        _mediaGroupBuffer[message.MediaGroupId] = (new List<global::Telegram.Bot.Types.Message> { message }, newTimer);
+                    }
+                }
+
+                // Отменяем предыдущий таймер — пришло ещё одно фото в той же группе
+                oldTimer?.Cancel();
+
+                // Ждём 800мс тишины — если за это время новых сообщений не пришло, флашим
+                try
+                {
+                    await Task.Delay(800, newTimer.Token);
+                }
+                catch (TaskCanceledException)
+                {
+                    return; // Придёт новый таймер, он и отправит
+                }
+
+                // Таймер не был отменён — мы последние, отправляем всю группу
+                List<global::Telegram.Bot.Types.Message> groupMessages;
+                lock (_mediaGroupLock)
+                {
+                    if (!_mediaGroupBuffer.TryGetValue(message.MediaGroupId, out var final))
+                        return;
+                    groupMessages = final.Messages;
+                    _mediaGroupBuffer.Remove(message.MediaGroupId);
+                }
+
+                await FlushMediaGroupToVk(botClient, groupMessages, secondTab, cancellationToken);
+                return;
+            }
+
+            // Одиночное сообщение — старая логика
+            await SendSingleMessageToVk(botClient, message, secondTab, cancellationToken);
+        }
+
+        private static async Task FlushMediaGroupToVk(
+            ITelegramBotClient botClient,
+            List<global::Telegram.Bot.Types.Message> messages,
+            SecondTab secondTab,
+            CancellationToken cancellationToken)
+        {
             var vkAttachments = new List<VkNet.Model.MediaAttachment>();
 
+            foreach (var msg in messages)
+            {
+                try
+                {
+                    var atts = await UploadTelegramAttachmentsToVk(botClient, msg, secondTab.User.PeerId);
+                    vkAttachments.AddRange(atts);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[VK] Ошибка загрузки вложения из альбома: {ex.Message}");
+                }
+            }
+
+            // Текст берём из первого сообщения группы (обычно там caption)
+            string text = messages.FirstOrDefault(m => !string.IsNullOrEmpty(m.Caption))?.Caption ?? string.Empty;
+            var textSb = new StringBuilder(text);
+            if (vkAttachments.Count > 0) textSb.Append(" [Ваши вложения]");
+
+            var newMessage = new VkNet.Model.Message()
+            {
+                Text = textSb.ToString(),
+                PeerId = secondTab.User.PeerId,
+                Date = DateTime.Now,
+                Type = VkNet.Enums.MessageType.Sended
+            };
+            await secondTab.User.AddMessage(newMessage);
+
+            try
+            {
+                var sendParams = new VkNet.Model.MessagesSendParams()
+                {
+                    PeerId = secondTab.User.PeerId,
+                    RandomId = new Random().Next(),
+                    Message = text
+                };
+                if (vkAttachments.Count > 0)
+                    sendParams.Attachments = vkAttachments;
+
+                newMessage.Id = vkService.GetVkApi().Messages.Send(sendParams);
+            }
+            catch (Exception ex) when (ex is CannotSendToUserFirstlyException || ex is CannotSendDuePrivacyException)
+            {
+                secondTab.User.RemoveMessage(newMessage);
+                var msg = await botClient.SendMessage(TelegramService.GetTelegramId(), "⚠️ Пользователь запретил вам писать личные сообщения");
+                TrackAndAutoDelete(secondTab, msg.MessageId);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка при отправке альбома в VK: {ex.Message}");
+            }
+
+            // Удаляем все сообщения альбома из Telegram
+            foreach (var msg in messages)
+            {
+                try
+                {
+                    await botClient.DeleteMessage(TelegramService.GetTelegramId(), msg.MessageId);
+                    secondTab.BotMessageIds.Remove(msg.MessageId);
+                }
+                catch { }
+            }
+        }
+
+        // Вынесенная логика одиночного сообщения (было телом AddNewMessageToVk)
+        private static async Task SendSingleMessageToVk(
+            ITelegramBotClient botClient,
+            global::Telegram.Bot.Types.Message message,
+            SecondTab secondTab,
+            CancellationToken cancellationToken)
+        {
+            var vkAttachments = new List<VkNet.Model.MediaAttachment>();
             try
             {
                 vkAttachments = await UploadTelegramAttachmentsToVk(botClient, message, secondTab.User.PeerId);
@@ -145,14 +267,16 @@ namespace vk_forwarder
             }
 
             var text = new StringBuilder(message.Text ?? message.Caption ?? string.Empty);
-            if (vkAttachments.Count > 0) text.Append("\n [Ваши вложения]");
+            if (vkAttachments.Count > 0) text.Append(" [Ваши вложения]");
 
-            // Add the outgoing message to local history
-            await secondTab.User.AddMessage(new VkNet.Model.Message()
+            var newMessage = new VkNet.Model.Message()
             {
                 Text = text.ToString(),
-                FromId = message.From?.Id ?? 0,
-            });
+                PeerId = secondTab.User.PeerId,
+                Date = DateTime.Now,
+                Type = VkNet.Enums.MessageType.Sended
+            };
+            await secondTab.User.AddMessage(newMessage);
 
             try
             {
@@ -162,18 +286,22 @@ namespace vk_forwarder
                     RandomId = new Random().Next(),
                     Message = message.Text ?? message.Caption ?? string.Empty
                 };
-
                 if (vkAttachments.Count > 0)
                     sendParams.Attachments = vkAttachments;
 
-                secondTab.User.Messages.Last().Id = vkService.GetVkApi().Messages.Send(sendParams);
+                newMessage.Id = vkService.GetVkApi().Messages.Send(sendParams);
+            }
+            catch (Exception ex) when (ex is CannotSendToUserFirstlyException || ex is CannotSendDuePrivacyException)
+            {
+                secondTab.User.RemoveMessage(newMessage);
+                var msg = await botClient.SendMessage(TelegramService.GetTelegramId(), "⚠️ Пользователь запретил вам писать личные сообщения");
+                TrackAndAutoDelete(secondTab, msg.MessageId);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Ошибка при отправке в VK: {ex.Message}");
             }
 
-            // Delete the user's reply message from Telegram after sending
             try
             {
                 await botClient.DeleteMessage(TelegramService.GetTelegramId(), message.MessageId);
@@ -291,6 +419,7 @@ namespace vk_forwarder
         {
             var firstTab = FirstTabs.FirstOrDefault(t => t.TabId == messageId);
             if (firstTab == null) return;
+            var textMessage = firstTab.User.ChatHistory;
 
             try
             {
@@ -298,7 +427,7 @@ namespace vk_forwarder
 
                 var sentMessage = await botClient.SendMessage(
                     chatId: TelegramService.GetTelegramId(),
-                    text: firstTab.User.ChatHistory,
+                    text: textMessage,
                     replyMarkup: secondTab.GetInlineKeyboard(),
                     linkPreviewOptions: new LinkPreviewOptions { IsDisabled = true }
                 );
@@ -485,7 +614,6 @@ namespace vk_forwarder
             var secondTab = SecondTabs.FirstOrDefault(t => t.TabId == tabMessageId);
             if (secondTab == null) return;
 
-            // Delete the selection prompt
             await secondTab.DeleteAllBotMessages();
 
             if (messageIndex < 0 || messageIndex >= secondTab.User.Messages.Count)
@@ -499,8 +627,6 @@ namespace vk_forwarder
             }
 
             var targetMessage = secondTab.User.Messages[messageIndex];
-
-            // Рекурсивно собираем все вложения
             var allAttachments = new List<VkNet.Model.Attachment>();
             CollectAllAttachmentsRecursive(targetMessage, allAttachments);
 
@@ -508,13 +634,96 @@ namespace vk_forwarder
             {
                 var noAttMsg = await botClient.SendMessage(
                     chatId: TelegramService.GetTelegramId(),
-                    text: $"В сообщении №{messageIndex + 1} нет вложений (включая пересланные и ответные)."
+                    text: $"В сообщении №{messageIndex + 1} нет вложений."
                 );
                 TrackAndAutoDelete(secondTab, noAttMsg.MessageId);
                 return;
             }
 
+            var chatId = TelegramService.GetTelegramId();
+
+            // Разделяем на медиагруппируемые (фото, видео, документы) и одиночные
+            var mediaGroupItems = new List<(IAlbumInputMedia media, string caption)>();
+            var singleAttachments = new List<VkNet.Model.Attachment>();
+
             foreach (var att in allAttachments)
+            {
+                switch (att.Type.Name)
+                {
+                    case "Photo":
+                        {
+                            var photo = att.Instance as VkNet.Model.Photo;
+                            var url = photo?.Sizes?.OrderByDescending(s => s.Width).FirstOrDefault()?.Url?.ToString();
+                            if (!string.IsNullOrEmpty(url))
+                                mediaGroupItems.Add((new InputMediaPhoto(new InputFileUrl(url)), photo?.Text ?? ""));
+                            break;
+                        }
+                    case "Video":
+                        {
+                            var video = att.Instance as VkNet.Model.Video;
+                            string? videoUrl = video?.Files?.Mp4_1080?.ToString()
+                                            ?? video?.Files?.Mp4_720?.ToString()
+                                            ?? video?.Files?.Mp4_480?.ToString()
+                                            ?? video?.Files?.Mp4_360?.ToString()
+                                            ?? video?.Files?.Mp4_240?.ToString();
+                            if (!string.IsNullOrEmpty(videoUrl))
+                                mediaGroupItems.Add((new InputMediaVideo(new InputFileUrl(videoUrl)),
+                                    $"🎬 {video?.Title}".Trim()));
+                            else
+                                singleAttachments.Add(att); // ссылка на VK — отдельным сообщением
+                            break;
+                        }
+                    case "Document":
+                        {
+                            var doc = att.Instance as VkNet.Model.Document;
+                            if (doc?.Uri != null)
+                                mediaGroupItems.Add((new InputMediaDocument(new InputFileUrl(doc.Uri.ToString())),
+                                    doc.Title ?? ""));
+                            else
+                                singleAttachments.Add(att);
+                            break;
+                        }
+                    case "Sticker":
+                    case "Graffiti":
+                        singleAttachments.Add(att); // фото, но лучше одиночным для наглядности
+                        break;
+                    default:
+                        singleAttachments.Add(att);
+                        break;
+                }
+            }
+
+            // Отправляем медиагруппы по 10 (лимит Telegram)
+            for (int i = 0; i < mediaGroupItems.Count; i += 10)
+            {
+                var chunk = mediaGroupItems.Skip(i).Take(10).ToList();
+                try
+                {
+                    // Применяем caption только к первому элементу группы
+                    var inputMedia = chunk.Select((item, idx) =>
+                    {
+                        if (idx == 0 && !string.IsNullOrWhiteSpace(item.caption))
+                        {
+                            // InputMediaPhoto/Video/Document имеют свойство Caption
+                            if (item.media is InputMediaPhoto p) p.Caption = item.caption;
+                            else if (item.media is InputMediaVideo v) v.Caption = item.caption;
+                            else if (item.media is InputMediaDocument d) d.Caption = item.caption;
+                        }
+                        return item.media;
+                    }).ToArray();
+
+                    var sentGroup = await botClient.SendMediaGroup(chatId, inputMedia);
+                    foreach (var m in sentGroup)
+                        secondTab.BotMessageIds.Add(m.MessageId);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Ошибка при отправке медиагруппы: {ex.Message}");
+                }
+            }
+
+            // Отправляем одиночные вложения (аудио, голосовые, ссылки и т.д.) — без изменений
+            foreach (var att in singleAttachments)
             {
                 try
                 {
@@ -522,255 +731,101 @@ namespace vk_forwarder
 
                     switch (att.Type.Name)
                     {
-                        case "Photo":
-                            {
-                                var photo = att.Instance as VkNet.Model.Photo;
-                                var url = photo?.Sizes?.OrderByDescending(s => s.Width).FirstOrDefault()?.Url?.ToString();
-                                if (!string.IsNullOrEmpty(url))
-                                {
-                                    sentMsg = await botClient.SendPhoto(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        photo: new InputFileUrl(url),
-                                        caption: photo?.Text
-                                    );
-                                }
-                            }
-                            break;
-
-                        case "Video":
+                        case "Video": // те что без прямой ссылки
                             {
                                 var video = att.Instance as VkNet.Model.Video;
-                                // Попытка получить прямую ссылку на mp4-файл
-                                string? videoUrl = video?.Files?.Mp4_1080?.ToString()
-                                                ?? video?.Files?.Mp4_720?.ToString()
-                                                ?? video?.Files?.Mp4_480?.ToString()
-                                                ?? video?.Files?.Mp4_360?.ToString()
-                                                ?? video?.Files?.Mp4_240?.ToString()
-                                                ?? video?.Files?.External?.ToString();
-
-                                if (!string.IsNullOrEmpty(videoUrl))
-                                {
-                                    sentMsg = await botClient.SendVideo(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        video: new InputFileUrl(videoUrl),
-                                        caption: $"🎬 {video?.Title}\n{video?.Description}".Trim()
-                                    );
-                                }
-                                else
-                                {
-                                    // Отправляем ссылку на видео
-                                    string link = video?.Id != null && video?.OwnerId != null
-                                        ? $"https://vk.com/video{video.OwnerId}_{video.Id}"
-                                        : "недоступно";
-                                    sentMsg = await botClient.SendMessage(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        text: $"🎥 Видео: {video?.Title ?? "без названия"}\n{link}",
-                                        linkPreviewOptions: new LinkPreviewOptions { IsDisabled = true }
-                                    );
-                                }
+                                string link = video?.Id != null && video?.OwnerId != null
+                                    ? $"https://vk.com/video{video.OwnerId}_{video.Id}"
+                                    : "недоступно";
+                                sentMsg = await botClient.SendMessage(chatId,
+                                    text: $"🎥 Видео: {video?.Title ?? "без названия"}\n{link}",
+                                    linkPreviewOptions: new LinkPreviewOptions { IsDisabled = true });
+                                break;
                             }
-                            break;
-
+                        case "Sticker":
+                            {
+                                var sticker = att.Instance as VkNet.Model.Sticker;
+                                var url = sticker?.Images?.OrderByDescending(i => i.Width).FirstOrDefault()?.Url?.ToString();
+                                sentMsg = !string.IsNullOrEmpty(url)
+                                    ? await botClient.SendPhoto(chatId, photo: new InputFileUrl(url))
+                                    : await botClient.SendMessage(chatId, text: $"🎭 Стикер (ID: {sticker?.Id})");
+                                break;
+                            }
+                        case "Graffiti":
+                            {
+                                var graffiti = att.Instance as VkNet.Model.Graffiti;
+                                var url = graffiti?.Photo586?.ToString() ?? graffiti?.Photo200?.ToString();
+                                sentMsg = !string.IsNullOrEmpty(url)
+                                    ? await botClient.SendPhoto(chatId, photo: new InputFileUrl(url), caption: "🎨 Граффити")
+                                    : await botClient.SendMessage(chatId, text: "🎨 Граффити");
+                                break;
+                            }
                         case "Document":
                             {
                                 var doc = att.Instance as VkNet.Model.Document;
-                                if (doc?.Uri != null)
-                                {
-                                    sentMsg = await botClient.SendDocument(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        document: new InputFileUrl(doc.Uri.ToString())
-                                    );
-                                }
-                                else
-                                {
-                                    sentMsg = await botClient.SendMessage(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        text: $"📄 Документ: {doc?.Title ?? "без названия"}"
-                                    );
-                                }
+                                sentMsg = await botClient.SendMessage(chatId, text: $"📄 Документ: {doc?.Title ?? "без названия"}");
+                                break;
                             }
-                            break;
-
                         case "Audio":
                             {
                                 var audio = att.Instance as VkNet.Model.Audio;
                                 string artist = audio?.Artist ?? "Неизвестный исполнитель";
                                 string title = audio?.Title ?? "Без названия";
-                                // VK Audio не всегда отдаёт прямую ссылку в API. Если есть Url – отправим как аудиофайл.
-                                if (audio?.Url != null)
-                                {
-                                    sentMsg = await botClient.SendAudio(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        audio: new InputFileUrl(audio.Url.ToString()),
-                                        title: title,
-                                        performer: artist
-                                    );
-                                }
-                                else
-                                {
-                                    sentMsg = await botClient.SendMessage(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        text: $"🎵 Аудиозапись: {artist} - {title}"
-                                    );
-                                }
+                                sentMsg = audio?.Url != null
+                                    ? await botClient.SendAudio(chatId, audio: new InputFileUrl(audio.Url.ToString()), title: title, performer: artist)
+                                    : await botClient.SendMessage(chatId, text: $"🎵 Аудиозапись: {artist} - {title}");
+                                break;
                             }
-                            break;
-
                         case "AudioMessage":
                             {
                                 var audioMsg = att.Instance as VkNet.Model.AudioMessage;
-                                if (audioMsg?.LinkMp3 != null)
-                                {
-                                    sentMsg = await botClient.SendVoice(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        voice: new InputFileUrl(audioMsg.LinkMp3.ToString())
-                                    );
-                                }
-                                else
-                                {
-                                    sentMsg = await botClient.SendMessage(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        text: $"🎤 Голосовое сообщение (длительность: {audioMsg?.Duration} сек.)"
-                                    );
-                                }
+                                sentMsg = audioMsg?.LinkMp3 != null
+                                    ? await botClient.SendVoice(chatId, voice: new InputFileUrl(audioMsg.LinkMp3.ToString()))
+                                    : await botClient.SendMessage(chatId, text: $"🎤 Голосовое ({audioMsg?.Duration} сек.)");
+                                break;
                             }
-                            break;
-
-                        case "Sticker":
-                            {
-                                var sticker = att.Instance as VkNet.Model.Sticker;
-                                // Стикер можно отправить как фото (берем максимальный размер)
-                                var url = sticker?.Images?.OrderByDescending(i => i.Width).FirstOrDefault()?.Url?.ToString();
-                                if (!string.IsNullOrEmpty(url))
-                                {
-                                    sentMsg = await botClient.SendPhoto(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        photo: new InputFileUrl(url)
-                                    );
-                                }
-                                else
-                                {
-                                    sentMsg = await botClient.SendMessage(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        text: $"🎭 Стикер (ID: {sticker?.Id})"
-                                    );
-                                }
-                            }
-                            break;
-
-                        case "Graffiti":
-                            {
-                                var graffiti = att.Instance as VkNet.Model.Graffiti;
-                                var url = graffiti?.Photo586?.ToString() ?? graffiti?.Photo200?.ToString();
-                                if (!string.IsNullOrEmpty(url))
-                                {
-                                    sentMsg = await botClient.SendPhoto(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        photo: new InputFileUrl(url),
-                                        caption: "🎨 Граффити"
-                                    );
-                                }
-                                else
-                                {
-                                    sentMsg = await botClient.SendMessage(
-                                        chatId: TelegramService.GetTelegramId(),
-                                        text: "🎨 Граффити"
-                                    );
-                                }
-                            }
-                            break;
-
                         case "Link":
                             {
                                 var link = att.Instance as VkNet.Model.Link;
-                                string linkInfo = $"🔗 Ссылка: {link?.Title ?? link?.Uri?.ToString() ?? "без названия"}";
-                                if (link?.Uri != null)
-                                    linkInfo += $"\n{link.Uri}";
-                                sentMsg = await botClient.SendMessage(
-                                    chatId: TelegramService.GetTelegramId(),
-                                    text: linkInfo,
-                                    linkPreviewOptions: false
-                                );
+                                string linkInfo = $"🔗 {link?.Title ?? link?.Uri?.ToString() ?? "Ссылка"}";
+                                if (link?.Uri != null) linkInfo += $"\n{link.Uri}";
+                                sentMsg = await botClient.SendMessage(chatId, text: linkInfo, linkPreviewOptions: false);
+                                break;
                             }
-                            break;
-
                         case "Note":
                             {
                                 var note = att.Instance as VkNet.Model.Note;
-                                sentMsg = await botClient.SendMessage(
-                                    chatId: TelegramService.GetTelegramId(),
-                                    text: $"📝 Заметка:\n{note?.Text ?? "без текста"}"
-                                );
+                                sentMsg = await botClient.SendMessage(chatId, text: $"📝 Заметка:\n{note?.Text ?? "без текста"}");
+                                break;
                             }
-                            break;
-
                         case "Poll":
                             {
                                 var poll = att.Instance as VkNet.Model.Poll;
                                 var sb = new StringBuilder();
                                 sb.AppendLine($"📊 Опрос: {poll?.Question ?? "Без вопроса"}");
                                 if (poll?.Answers != null)
-                                {
                                     foreach (var answer in poll.Answers)
-                                    {
                                         sb.AppendLine($"- {answer.Text} (голосов: {answer.Votes})");
-                                    }
-                                }
-                                sentMsg = await botClient.SendMessage(
-                                    chatId: TelegramService.GetTelegramId(),
-                                    text: sb.ToString()
-                                );
+                                sentMsg = await botClient.SendMessage(chatId, text: sb.ToString());
+                                break;
                             }
-                            break;
-
                         case "Gift":
                             {
                                 var gift = att.Instance as VkNet.Model.Gift;
-                                sentMsg = await botClient.SendMessage(
-                                    chatId: TelegramService.GetTelegramId(),
-                                    text: $"🎁 Подарок: {gift?.Id}"
-                                );
+                                sentMsg = await botClient.SendMessage(chatId, text: $"🎁 Подарок: {gift?.Id}");
+                                break;
                             }
-                            break;
-
                         case "Wall":
                             {
                                 var wallPost = att.Instance as VkNet.Model.Wall;
-                                string postInfo = $"📰 Запись со стены";
+                                string postInfo = "📰 Запись со стены";
                                 if (wallPost?.Id != null && wallPost?.OwnerId != null)
                                     postInfo += $"\nhttps://vk.com/wall{wallPost.OwnerId}_{wallPost.Id}";
-                                sentMsg = await botClient.SendMessage(
-                                    chatId: TelegramService.GetTelegramId(),
-                                    text: postInfo
-                                );
+                                sentMsg = await botClient.SendMessage(chatId, text: postInfo);
+                                break;
                             }
-                            break;
-
-                        case "Market":
-                            {
-                                var market = att.Instance as VkNet.Model.Market;
-                                sentMsg = await botClient.SendMessage(
-                                    chatId: TelegramService.GetTelegramId(),
-                                    text: $"🛒 Товар: {market?.Title ?? "без названия"}"
-                                );
-                            }
-                            break;
-
-                        case "Album":
-                            {
-                                var album = att.Instance as VkNet.Model.Album;
-                                sentMsg = await botClient.SendMessage(
-                                    chatId: TelegramService.GetTelegramId(),
-                                    text: $"🖼️ Альбом: {album?.Title ?? "без названия"} ({album?.Size} фото)"
-                                );
-                            }
-                            break;
-
                         default:
-                            sentMsg = await botClient.SendMessage(
-                                chatId: TelegramService.GetTelegramId(),
-                                text: $"📎 Вложение: {att.Type.Name}"
-                            );
+                            sentMsg = await botClient.SendMessage(chatId, text: $"📎 Вложение: {att.Type.Name}");
                             break;
                     }
 
@@ -779,28 +834,24 @@ namespace vk_forwarder
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Ошибка при отправке вложения типа {att.Type.Name}: {ex.Message}");
+                    Console.WriteLine($"Ошибка при отправке вложения {att.Type.Name}: {ex.Message}");
                 }
             }
 
-            // Send "back" button below attachments
+            // Кнопка "Назад"
             try
             {
-                var backKeyboard = new InlineKeyboardMarkup(new[]
-                {
-            new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", $"words:back_attachments:{tabMessageId}") }
-        });
-
                 string sourceInfo = "";
-                if (targetMessage.ForwardedMessages != null && targetMessage.ForwardedMessages.Count > 0)
-                    sourceInfo += " (включая пересланные)";
-                if (targetMessage.ReplyMessage != null)
-                    sourceInfo += " (включая ответное)";
+                if (targetMessage.ForwardedMessages?.Count > 0) sourceInfo += " (включая пересланные)";
+                if (targetMessage.ReplyMessage != null) sourceInfo += " (включая ответное)";
 
                 var backMsg = await botClient.SendMessage(
-                    chatId: TelegramService.GetTelegramId(),
+                    chatId: chatId,
                     text: $"⬆️ Вложения сообщения №{messageIndex + 1}{sourceInfo}",
-                    replyMarkup: backKeyboard
+                    replyMarkup: new InlineKeyboardMarkup(new[]
+                    {
+                new[] { InlineKeyboardButton.WithCallbackData("🔙 Назад", $"words:back_attachments:{tabMessageId}") }
+                    })
                 );
                 secondTab.BotMessageIds.Add(backMsg.MessageId);
                 secondTab.AdditionalMessageId = backMsg.MessageId;

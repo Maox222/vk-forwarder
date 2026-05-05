@@ -2,6 +2,7 @@ using Telegram.Bot;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Exceptions;
 
 namespace vk_forwarder.Telegram
 {
@@ -24,7 +25,8 @@ namespace vk_forwarder.Telegram
             _botClient.StartReceiving(
                 updateHandler: HandleUpdateAsync,
                 errorHandler: HandleErrorAsync,
-                receiverOptions: receiverOptions
+                receiverOptions: receiverOptions,
+                cancellationToken: CancellationToken.None
             );
 
         }
@@ -202,7 +204,19 @@ namespace vk_forwarder.Telegram
             Exception exception,
             CancellationToken cancellationToken)
         {
-            Console.WriteLine($"[Telegram Error] {exception.Message}");
+            // RequestException covers timeouts, network drops, 5xx from Telegram.
+            // These are transient — log and let StartReceiving retry automatically.
+            if (exception is RequestException reqEx)
+            {
+                Console.WriteLine($"[Telegram Network] {reqEx.Message} — переподключение...");
+                return Task.CompletedTask;
+            }
+
+            if (exception is OperationCanceledException)
+                return Task.CompletedTask;
+
+            // Unexpected error — log but do NOT rethrow so the bot stays alive
+            Console.WriteLine($"[Telegram Error] {exception.GetType().Name}: {exception.Message}");
             return Task.CompletedTask;
         }
     }

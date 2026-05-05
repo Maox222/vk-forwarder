@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Configuration;
+﻿using System.Runtime.InteropServices;
 using vk_forwarder.Telegram;
 
 namespace vk_forwarder
@@ -7,6 +7,36 @@ namespace vk_forwarder
     {
         static async Task Main(string[] args)
         {
+
+            var cts = new CancellationTokenSource();
+
+            // Регистрируем обработчики ДО запуска любых сервисов
+            // SIGINT (Ctrl+C)
+            Console.CancelKeyPress += (_, e) => {
+                e.Cancel = true;
+                cts.Cancel();
+            };
+
+            // SIGTERM (systemd stop/restart) — на Linux CancelKeyPress его не ловит
+            // ВАЖНО: сохраняем в переменную — иначе GC соберёт объект и регистрация отменится
+            var sigtermReg = PosixSignalRegistration.Create(PosixSignal.SIGTERM, _ =>
+            {
+                Console.WriteLine("Получен SIGTERM, останавливаем бот...");
+                cts.Cancel();
+            });
+
+            // Глобальная защита: unobserved исключения из Task.Run не убивают процесс
+            TaskScheduler.UnobservedTaskException += (_, e) =>
+            {
+                Console.WriteLine($"[UnobservedTask] {e.Exception.GetBaseException().Message}");
+                e.SetObserved();
+            };
+
+            // Любое необработанное исключение в потоке — логируем и не падаем
+            AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            {
+                Console.WriteLine($"[UnhandledException] {(e.ExceptionObject as Exception)?.Message}");
+            };
 
             try
             {
@@ -28,7 +58,6 @@ namespace vk_forwarder
                 }
 
                 TelegramService.StartService(tgToken, tgId);
-
             }
             catch (Exception ex)
             {
@@ -38,22 +67,24 @@ namespace vk_forwarder
 
             PrintBanner();
 
-            var cts = new CancellationTokenSource();
-
-            // Обработка Ctrl+C и сигналов systemd (SIGTERM)
-            Console.CancelKeyPress += (_, e) => {
-                e.Cancel = true;
-                cts.Cancel();
-            };
-            AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
-
             try
             {
+                Console.WriteLine("[Main] Начинаем слушать VK LongPoll...");
                 await vkService.StartListening(cts.Token);
+                Console.WriteLine("[Main] StartListening завершился штатно.");
             }
             catch (OperationCanceledException)
             {
-                Console.WriteLine("Бот остановлен.");
+                Console.WriteLine($"[Main] Бот остановлен через отмену токена. IsCancellationRequested={cts.IsCancellationRequested}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Main] Необработанное исключение: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                sigtermReg.Dispose();
+                Console.WriteLine("[Main] Выход из Main.");
             }
 
         }
@@ -63,7 +94,7 @@ namespace vk_forwarder
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine(@"
             ╔═════════════════════════════════════════════════════╗
-            ║          VK Group ↔ Telegram Bridge v1.7            ║
+            ║          VK Group ↔ Telegram Bridge v1.9            ║
             ║   Пересылка сообщений между группой ВК и Telegram   ║
             ╚════════════╗                          ╔═════════════╝
                          ║    [\..Бот запущен../]   ║                   
