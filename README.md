@@ -3,7 +3,7 @@
 
 <p align="center">
   <img src="images/Screenshot_10.png" width="45%">
-  <img src="images/Screenshot_1.png" width="45%">
+
 </p>
 
 ## Возможности
