@@ -85,7 +85,7 @@ namespace vk_forwarder
         public VkApi               Api     { get; init; }
         public long?               GroupId { get; init; }
         public string              FirstName { get; init; } = "";
-        public string?             Photo { get; set; }
+        public long?               PriceTag { get; init; }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ namespace vk_forwarder
         /// Returns the response text for the given payload key.
         /// Falls back to a generic message if the key is missing.
         /// </summary>
-        private static VkResponse GetResponse(string payload, string? firstName = null)
+        private static VkResponse GetResponse(string payload, string? firstName = null, string? priceTag = null)
         {
             var source = _responses.TryGetValue(payload, out var r) ? r
                          : new VkResponse { Text = $"[Ответ для «{payload}» не найден]" };
@@ -185,6 +185,8 @@ namespace vk_forwarder
 
             if (!string.IsNullOrEmpty(firstName))
                 resp.Text = resp.Text.Replace("{firstName}", firstName);
+            if (!string.IsNullOrEmpty(priceTag))
+                resp.Text = resp.Text.Replace("{priceTag}", priceTag);
 
             return resp;
         }
@@ -211,6 +213,7 @@ namespace vk_forwarder
             public string? Payload { get; set; }   // text button
             public string? Url     { get; set; }   // link button
             public string  Color   { get; set; } = "default";
+            public string? PriceTag { get; set; }
         }
 
         /// <summary>
@@ -278,6 +281,10 @@ namespace vk_forwarder
 
                     _buttonHandlers[payloadKey] = async ctx =>
                     {
+                        //var key = config.Menus.FirstOrDefault(m => m.Payload == ctx.Payload);
+                        //var rows = key?.Rows.SelectMany(row => row);
+                        //var button = rows?.FirstOrDefault(r => r.Label == ctx.Message.Text);
+
                         var kb   = _keyboards.TryGetValue(payloadKey, out var k) ? k : null;
                         var resp = GetResponse(payloadKey, payloadKey == "start" ? ctx.FirstName : null);
                         await SendMessageAsync(ctx.PeerId, resp.Text, kb, photos: resp.Photo, videos: resp.Video);
@@ -417,9 +424,9 @@ namespace vk_forwarder
                     var history = api.Groups.GetBotsLongPollHistory(new BotsLongPollHistoryParams
                     {
                         Server = longPollServer.Server,
-                        Ts     = longPollServer.Ts,
-                        Key    = longPollServer.Key,
-                        Wait   = 25
+                        Ts = longPollServer.Ts,
+                        Key = longPollServer.Key,
+                        Wait = 25
                     });
 
                     longPollServer.Ts = history.Ts;
@@ -458,33 +465,71 @@ namespace vk_forwarder
                 catch (VkNet.Exception.LongPollKeyExpiredException)
                 {
                     Console.WriteLine("[VK LongPoll] Ключ истёк, обновляем...");
-                    var fresh = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
-                    longPollServer.Key = fresh.Key;
-                    longPollServer.Ts  = fresh.Ts;
+                    try
+                    {
+                        var fresh = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
+                        longPollServer.Key = fresh.Key;
+                        longPollServer.Ts = fresh.Ts;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[VK LongPoll] Не удалось обновить ключ: {ex.Message}");
+                        await SafeDelay(10000, ct);
+                    }
                 }
                 catch (VkNet.Exception.LongPollInfoLostException)
                 {
                     Console.WriteLine("[VK LongPoll] История потеряна, переподключаемся...");
-                    longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
+                    try
+                    {
+                        longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[VK LongPoll] Не удалось переподключиться: {ex.Message}");
+                        await SafeDelay(10000, ct);
+                    }
                 }
                 catch (VkNet.Exception.LongPollOutdateException)
                 {
                     Console.WriteLine("[VK LongPoll] Ts устарел, обновляем сервер...");
-                    longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
+                    try
+                    {
+                        longPollServer = api.Groups.GetLongPollServer(Convert.ToUInt64(GroupId));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[VK LongPoll] Не удалось обновить сервер: {ex.Message}");
+                        await SafeDelay(10000, ct);
+                    }
                 }
                 catch (OperationCanceledException)
                 {
+                    Console.WriteLine("[VK LongPoll] Получена отмена, выходим...");
                     break;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[VK LongPoll Error] {ex.Message}");
-                    await Task.Delay(5000, ct);
+                    // Log full type so we can identify unknown exceptions (e.g. SocketException,
+                    // HttpRequestException) that VkNet does not wrap in its own types
+                    Console.WriteLine($"[VK LongPoll Error] {ex.GetType().Name}: {ex.Message}");
+                    await SafeDelay(5000, ct);
                 }
             }
 
             _messageQueue.Writer.Complete();
             await workerTask;
+        }
+
+        /// <summary>
+        /// Task.Delay that silently exits on cancellation instead of throwing.
+        /// Prevents OperationCanceledException from escaping the while loop
+        /// when ct is cancelled during a recovery delay.
+        /// </summary>
+        private static async Task SafeDelay(int milliseconds, CancellationToken ct)
+        {
+            try { await Task.Delay(milliseconds, ct); }
+            catch (OperationCanceledException) { }
         }
 
         // ──────────────────────────────────────────────────────────────────────
@@ -534,7 +579,7 @@ namespace vk_forwarder
                 string firstName = existingTab?.User.FirstName
                     ?? vkApiUser?.FirstName
                     ?? "";
-
+                
                 await _buttonHandlers[payload](new VkButtonContext
                 {
                     Message   = message,

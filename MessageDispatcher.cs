@@ -419,6 +419,13 @@ namespace vk_forwarder
         {
             var firstTab = FirstTabs.FirstOrDefault(t => t.TabId == messageId);
             if (firstTab == null) return;
+
+            if (SecondTabs.Count > 0) 
+            {
+                var secondTab = SecondTabs.FirstOrDefault();
+                if (secondTab != null) await HandleBack(secondTab.TabId);
+            }
+
             var textMessage = firstTab.User.ChatHistory;
 
             try
@@ -897,13 +904,11 @@ namespace vk_forwarder
 
         private static async Task AutoDeleteMessage(SecondTab secondTab, int messageId)
         {
-            // Guard: if already removed from tracking (deleted manually), nothing to do
-            if (secondTab != null)
-            {
-                if (!secondTab.BotMessageIds.Contains(messageId)) return;
+            if (secondTab == null) return;
 
-                secondTab.BotMessageIds.Remove(messageId);
-            }
+            // Guard: if already removed from tracking (deleted manually), nothing to do
+            if (!secondTab.BotMessageIds.Contains(messageId)) return;
+            secondTab.BotMessageIds.Remove(messageId);
 
             var bot = TelegramService.GetTelegramBot();
             var chatId = TelegramService.GetTelegramId();

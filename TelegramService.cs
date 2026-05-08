@@ -180,6 +180,11 @@ namespace vk_forwarder.Telegram
 
             // Второе нажатие — подтверждение получено
             int warnId = firstTab.ConfirmationMessageId;
+            if (MessageDispatcher.SecondTabs.Count > 0) 
+            {
+                var secondTab = MessageDispatcher.SecondTabs.FirstOrDefault(t => t.User.PeerId == firstTab.User.PeerId);
+                if (secondTab != null) await MessageDispatcher.HandleBack(secondTab.TabId);
+            }
             MessageDispatcher.FirstTabs.Remove(firstTab);
             firstTab.Dispose();
 
