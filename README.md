@@ -1,4 +1,6 @@
 # vk-forwarder
+Новая версия бота - https://github.com/Maox222/vkadmin-messages/
+
 Бот для пересылки сообщений из группы ВКонтакте в Telegram с возможностью отвечать прямо из Telegram.
 
 <p align="center">
